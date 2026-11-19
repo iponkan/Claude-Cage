@@ -1,0 +1,42 @@
+name: Publish iOS IPA
+
+on:
+  push:
+    tags:
+      - 'ios-v*'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: mobile/bindings/go.mod
+          cache-dependency-path: |
+            go.sum
+            mobile/bindings/go.sum
+      - name: Select Xcode 26
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_26.6.app
+          xcodebuild -version
+      - name: Build iPhone IPA
+        run: |
+          npm ci --prefix ui
+          bash mobile/build.sh ios-ipa-unsigned
+      - name: Publish the IPA to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" mobile/.build/ios/CageMobile-unsigned.ipa \
+            --verify-tag --latest=false --title "Cage Mobile ${GITHUB_REF_NAME#ios-}" \
+            --notes "iPhone build for iOS 26. Sign the IPA before installing it."

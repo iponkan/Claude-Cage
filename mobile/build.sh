@@ -4,6 +4,7 @@ mobile_dir="$(cd "$(dirname "$0")" && pwd)"
 cd "$mobile_dir"
 case "${1:-}" in
   android|ios) platform="$1" ;;
+  ios-ipa-unsigned) platform=ios ;;
   android-release) platform=android ;;
   ios-ipa|ios-ipa-basic)
     platform=ios
@@ -12,7 +13,7 @@ case "${1:-}" in
       exit 2
     fi
     ;;
-  *) echo "Usage: mobile/build.sh android | android-release | ios | ios-ipa TEAM_ID | ios-ipa-basic TEAM_ID" >&2; exit 2 ;;
+  *) echo "Usage: mobile/build.sh android | android-release | ios | ios-ipa-unsigned | ios-ipa TEAM_ID | ios-ipa-basic TEAM_ID" >&2; exit 2 ;;
 esac
 if [[ "$platform" == ios ]]; then
   # xcrun distinguishes a missing SDK from a pending Xcode license or setup step.
@@ -46,7 +47,17 @@ if [[ "$platform" == ios ]]; then
   # One arm64 iPhone slice and one simulator slice for this Mac.
   # Each platform framework is then passed to -create-xcframework exactly once.
   (cd bindings && gomobile bind -target="ios/arm64,iossimulator/$(go env GOHOSTARCH)" -iosversion=17.0 -o "$mobile_dir/.build/ios/Cagemobile.xcframework" .)
-  if [[ "$1" == ios-ipa* ]]; then
+  if [[ "$1" == ios-ipa-unsigned ]]; then
+    output=$(mktemp -d "$mobile_dir/.build/ios/unsigned-XXXXXXXX")
+    trap 'rm -r "$output"' EXIT
+    xcodebuild -project ios/CageMobile.xcodeproj -scheme CageMobile -configuration Release \
+      -destination 'generic/platform=iOS' -derivedDataPath "$output/build" \
+      CODE_SIGNING_ALLOWED=NO build
+    mkdir "$output/Payload"
+    ditto "$output/build/Build/Products/Release-iphoneos/CageMobile.app" "$output/Payload/CageMobile.app"
+    ditto -c -k --keepParent "$output/Payload" "$output/CageMobile-unsigned.ipa"
+    mv "$output/CageMobile-unsigned.ipa" .build/ios/
+  elif [[ "$1" == ios-ipa* ]]; then
     scheme=CageMobile
     if [[ "$1" == ios-ipa-basic ]]; then scheme=CageMobileBasic; fi
     output=$(mktemp -d "$mobile_dir/.build/ios/device-XXXXXXXX")
