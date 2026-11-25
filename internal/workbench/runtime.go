@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -17,13 +18,21 @@ import (
 	"github.com/sylvinus/agent-vm/internal/cage"
 	"github.com/sylvinus/agent-vm/internal/containerenv"
 	"github.com/sylvinus/agent-vm/internal/diagnostics"
+	"github.com/sylvinus/agent-vm/internal/exitpolicy"
 	"github.com/sylvinus/agent-vm/internal/guestos"
 	"github.com/sylvinus/agent-vm/internal/host"
 	"github.com/sylvinus/agent-vm/internal/hostimage"
 	"github.com/sylvinus/agent-vm/internal/managedproxy"
+	"github.com/sylvinus/agent-vm/internal/vm"
+	"github.com/sylvinus/agent-vm/internal/vmname"
 )
 
 var loadConfig = cage.Load
+
+// previousDNSFile keeps the DNS options of previous-profile.json, whose
+// configuration JSON does not carry them.
+const previousDNSFile = "previous-dns.json"
+
 var defaultConfig = cage.DefaultConfig
 
 type guestCredentials struct {
@@ -42,9 +51,6 @@ func (s *Server) workspaceLocked() string {
 func (s *Server) workspace() string      { s.mu.Lock(); defer s.mu.Unlock(); return s.workspaceLocked() }
 func (s *Server) environmentDir() string { return environmentWorkspace(s.profile) }
 func (s *Server) sshTarget() string {
-	if s.macosGuest != nil {
-		return "cage-macos"
-	}
 	if containerenv.Configured(s.profile) {
 		return "cage-container"
 	}
@@ -52,9 +58,6 @@ func (s *Server) sshTarget() string {
 }
 
 func (s *Server) environmentPrepared() bool {
-	if s.windowsGuest != nil {
-		return true
-	}
 	if containerenv.Configured(s.profile) {
 		environment, err := containerenv.Load(s.profile)
 		if err != nil {
@@ -65,8 +68,32 @@ func (s *Server) environmentPrepared() bool {
 		state, err := environment.State(ctx)
 		return err == nil && state.Exists
 	}
-	_, err := os.Stat(filepath.Join(s.profile, "state", ".agent-vm-base-version"))
-	return err == nil
+	return s.limaEnvironmentPrepared()
+}
+
+func (s *Server) limaEnvironmentPrepared() bool {
+	// An intact existing VM instance carries its own config and disk and can
+	// start even if the base template or version marker is missing.
+	if dir := s.instanceDir(); dir != "" && limaInstanceReady(dir) {
+		return true
+	}
+	if _, err := os.Stat(filepath.Join(s.profile, "state", ".agent-vm-base-version")); err != nil {
+		return false
+	}
+	return limaInstanceReady(filepath.Join(s.profile, "state", "lima", vmname.Template))
+}
+
+func limaInstanceReady(dir string) bool {
+	yamlInfo, err := os.Stat(filepath.Join(dir, "lima.yaml"))
+	if err != nil || !yamlInfo.Mode().IsRegular() {
+		return false
+	}
+	for _, disk := range []string{"disk", "diffdisk", "basedisk"} {
+		if info, err := os.Stat(filepath.Join(dir, disk)); err == nil && info.Mode().IsRegular() {
+			return true
+		}
+	}
+	return false
 }
 func (s *Server) sshCommand(ctx context.Context, args ...string) *exec.Cmd {
 	return s.sshCommandOptions(ctx, false, args...)
@@ -75,12 +102,6 @@ func (s *Server) sshCommandWithForwarding(ctx context.Context, args ...string) *
 	return s.sshCommandOptions(ctx, true, args...)
 }
 func (s *Server) sshCommandOptions(ctx context.Context, maintenance bool, args ...string) *exec.Cmd {
-	if s.windowsGuest != nil {
-		return &exec.Cmd{Err: errors.New("Windows 客机不支持 Linux SSH 控制脚本")}
-	}
-	if s.macosGuest != nil {
-		return s.macOSSSHCommand(ctx, args...)
-	}
 	cfg := filepath.Join(s.instanceDir(), "ssh.config")
 	base := []string{"-q", "-e", "none", "-F", cfg, "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "PermitLocalCommand=no", "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no", "-o", "ProxyCommand=none", "-o", "ProxyJump=none", "-o", "ConnectTimeout=3", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2", "-o", "ForwardAgent=no", "-o", "IdentityAgent=none", "-o", "ForwardX11=no", "-o", "ClearAllForwardings=yes", "-o", "ControlPath=none"}
 	if maintenance {
@@ -101,49 +122,51 @@ func (s *Server) guest(ctx context.Context, script string) ([]byte, error) {
 }
 
 func (s *Server) guestControl(ctx context.Context, script, diagnosticSource string) ([]byte, error) {
-	if s.windowsGuest != nil {
-		return nil, errors.New("Windows 客机不支持 Linux 控制脚本")
-	}
+	data, _, err := s.guestControlOutput(ctx, script, diagnosticSource, diagnosticSource != "")
+	return data, err
+}
+
+func (s *Server) guestControlWithStderr(ctx context.Context, script string) ([]byte, string, error) {
+	return s.guestControlOutput(ctx, script, "", true)
+}
+
+func (s *Server) guestControlOutput(ctx context.Context, script, diagnosticSource string, captureStderr bool) ([]byte, string, error) {
 	// SSH enters the user's default shell. Run control scripts in Bash so
 	// zsh initialization cannot change their redirection or error behavior.
 	command := "exec /bin/bash --noprofile --norc -c " + shellescape.Quote(script)
 	cmd := s.sshCommand(ctx, "-T", s.sshTarget(), "--", command)
 	var stderr fileControlStderr
-	if diagnosticSource != "" {
+	if captureStderr {
 		cmd.Stderr = &stderr
-		defer func() {
-			if len(stderr.data) > 0 {
-				_ = diagnostics.New(s.profile).Record("warn", diagnosticSource, "guest control stderr: "+string(stderr.data))
-			}
-		}()
+		if diagnosticSource != "" {
+			defer func() {
+				if len(stderr.data) > 0 {
+					_ = diagnostics.New(s.profile).Record("warn", diagnosticSource, "guest control stderr: "+string(stderr.data))
+				}
+			}()
+		}
 	}
 	pipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if err = cmd.Start(); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	data, readErr := io.ReadAll(io.LimitReader(pipe, (64<<10)+1))
 	if readErr != nil || len(data) > 64<<10 {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-		return nil, errors.New("guest control response exceeded its limit")
+		return nil, string(stderr.data), errors.New("guest control response exceeded its limit")
 	}
 	if err = cmd.Wait(); err != nil {
-		return nil, err
+		return nil, string(stderr.data), err
 	}
-	return data, nil
+	return data, string(stderr.data), nil
 }
 func (s *Server) attach() error {
 	if err := s.requireStorageReady(); err != nil {
 		return err
-	}
-	if s.windowsGuest != nil {
-		return s.attachWindowsGuest()
-	}
-	if s.macosGuest != nil {
-		return s.attachMacOSGuest()
 	}
 	if err := s.requireCurrentLinuxTransferMount(); err != nil {
 		return err
@@ -179,22 +202,27 @@ func (s *Server) attach() error {
 	} else if !s.vmRunning() {
 		return errors.New("环境尚未启动")
 	}
-	b, err := s.guest(ctx, guestConnectionSnapshot)
+	s.mu.Lock()
+	reuseLogin := s.preferences.ReuseClaudeLogin
+	s.mu.Unlock()
+	b, err := s.guest(ctx, linuxLoginPreferences(reuseLogin)+"\n"+guestConnectionSnapshot)
 	if err != nil {
 		return errors.New("环境尚未准备好")
 	}
 	credentials, manifest, err := parseGuestConnection(b)
 	s.mu.Lock()
 	s.guestManifest = manifest
-	s.guestUpdateRequired = errors.Is(err, errGuestUpdateRequired)
-	s.guestUpdateError = ""
+	message := ""
 	if err != nil {
 		s.ready = false
-		s.guestUpdateError = err.Error()
+		message = err.Error()
 	}
+	s.setGuestUpdateLocked(guestComponentsUnavailable(err), message)
 	s.mu.Unlock()
 	if err != nil {
-		if errors.Is(err, errGuestUpdateRequired) {
+		if errors.Is(err, errGuestRecoveryRequired) {
+			_ = s.closeProxyGate("环境组件清单缺失或上次更新中断，外网保持关闭")
+		} else if errors.Is(err, errGuestUpdateRequired) {
 			_ = s.closeProxyGate("环境组件需要更新，外网保持关闭")
 		}
 		return err
@@ -217,7 +245,11 @@ func (s *Server) attach() error {
 	s.credentials = credentials
 	s.ready = true
 	s.mu.Unlock()
+	if v := resolvedGuestTheme(s.profile); v != "" {
+		s.applyGuestThemeAsync(v)
+	}
 	s.restoreProjectShares()
+	s.ensureHostTools()
 	s.desktopViews.background(s.changeDesktopVisibility)
 	s.browserViews.background(s.changeBrowserVisibility)
 	return nil
@@ -235,7 +267,7 @@ func (s *Server) monitor(ctx context.Context) {
 				ready := s.ready
 				token := s.credentials.Token
 				s.mu.Unlock()
-				if !ready || s.macosGuest != nil || s.windowsGuest != nil {
+				if !ready {
 					_ = s.attach()
 				} else {
 					ctx, cancel := s.controlContext()
@@ -245,13 +277,11 @@ func (s *Server) monitor(ctx context.Context) {
 						s.mu.Lock()
 						s.ready = false
 						s.mu.Unlock()
+					} else {
+						s.ensureHostTools()
 					}
 				}
 				timing.stage("environment_health")
-				if s.macosGuest != nil {
-					s.monitorNetworkTick()
-					timing.stage("network_tick")
-				}
 			} else {
 				timing.result = "job_running"
 			}
@@ -294,10 +324,25 @@ func (s *Server) runCage(args ...string) error {
 			cmd.Dir = s.profile
 		}
 	}
-	cmd.Env = append(os.Environ(), cage.ConfigEnv+"="+s.configPath)
+	cmd.Env = append(vm.ChildEnv(), cage.ConfigEnv+"="+s.configPath)
 	execution := s.jobs.execution()
 	if len(args) == 1 && args[0] == "setup" {
 		cmd.Env = append(cmd.Env, "CAGE_SETUP_PROGRESS=1")
+	}
+	s.mu.Lock()
+	mirror := s.preferences.DebianMirror
+	tls12Compat := s.preferences.InstallTLS12Compat
+	s.mu.Unlock()
+	if mirror != "" {
+		cmd.Env = append(cmd.Env, cage.DebianMirrorEnv+"="+mirror)
+	}
+	if tls12Compat {
+		cmd.Env = append(cmd.Env, cage.InstallTLS12Env+"=1")
+	}
+	if len(args) > 0 && args[0] == "up" {
+		if v := resolvedGuestTheme(s.profile); v != "" {
+			cmd.Env = append(cmd.Env, cage.GuestThemeEnv+"="+v)
+		}
 	}
 	cmd.Env = append(cmd.Env, cage.JobEnv+"="+execution.id)
 	cmd.Stdout, cmd.Stderr = execution, execution
@@ -331,17 +376,10 @@ func (s *Server) startEnvironment(syncTimezone bool) error {
 	s.desktopViews.reset()
 	s.browserViews.reset()
 	s.controlSession.close()
-	s.nativeControl.close()
 	s.desktopStatus.invalidate()
 	defer s.desktopStatus.invalidate()
 	if err := s.requireStorageReady(); err != nil {
 		return err
-	}
-	if s.macosGuest != nil {
-		return s.startMacOSGuest()
-	}
-	if s.windowsGuest != nil {
-		return s.startWindowsGuest()
 	}
 	if err := s.requireCurrentLinuxTransferMount(); err != nil {
 		return err
@@ -380,6 +418,14 @@ func (s *Server) startEnvironment(syncTimezone bool) error {
 			_ = s.closeProxyGate(failure.Message)
 			return failure
 		}
+	} else {
+		// A container's share is sshfs over a quoted path, a VM's is Lima's.
+		if err := mountableEnvironmentDir(s.environmentDir()); err != nil {
+			return err
+		}
+		if err := cage.ValidateProfileLimaSocketPaths(s.profile); err != nil {
+			return err
+		}
 	}
 	cfg, err := loadConfig(s.configPath)
 	if err != nil {
@@ -402,8 +448,11 @@ func (s *Server) startEnvironment(syncTimezone bool) error {
 			_ = s.closeProxyGate(e.Error())
 			return e
 		}
-		bound, _ := managedproxy.BoundInterface(filepath.Join(managedproxy.Dir(s.profile), "config.yaml"))
-		if bound != name || !managedproxy.Running(s.operationContext(), s.profile, p) {
+		configPath := filepath.Join(managedproxy.Dir(s.profile), "config.yaml")
+		// DNS settings saved since the core started reach it here: the save
+		// already restarts the environment, so reloading the core now adds no
+		// further outage and its resolvers match guest DNS and the check.
+		if !managedproxy.BindingMatches(configPath, name) || proxyDNSOutdated(p, cfg) || !managedproxy.Running(s.operationContext(), s.profile, p) {
 			// Every core start changes the report generation, including recovery.
 			if e = s.activateProxy(p, cfg); e != nil {
 				return e
@@ -416,7 +465,7 @@ func (s *Server) startEnvironment(syncTimezone bool) error {
 	}
 
 	attachErr := s.attach()
-	if errors.Is(attachErr, errGuestUpdateRequired) {
+	if guestComponentsUnavailable(attachErr) {
 		return s.synchronizeEnvironment()
 	}
 	if attachErr == nil {
@@ -481,7 +530,7 @@ func (s *Server) startEnvironment(syncTimezone bool) error {
 	} else if probeErr != nil {
 		s.setMessage("代理出口无法通过检查，正在启动离线环境…")
 	}
-	if _, err = os.Stat(filepath.Join(s.profile, "state", ".agent-vm-base-version")); !containerenv.Configured(s.profile) && os.IsNotExist(err) {
+	if !containerenv.Configured(s.profile) && !s.limaEnvironmentPrepared() {
 		s.setMessage("首次准备 Linux 环境与开发工具，可能需要数分钟…")
 		job := s.jobs.execution()
 		job.setSetupProgress(&SetupProgress{Phase: "image", System: linuxSystem, Label: "正在准备 " + guestProgressName(linuxSystem) + " 镜像"})
@@ -515,12 +564,6 @@ func (s *Server) stopEnvironment() (returned error) {
 			returned = managedproxy.Stop(s.profile)
 		}
 	}()
-	if s.windowsGuest != nil {
-		return s.stopWindowsGuest()
-	}
-	if s.macosGuest != nil {
-		return s.stopMacOSGuest()
-	}
 	s.setMessage("正在停止 Cage 环境…")
 	if (explicitStop || s.jobs.snapshot().Kind == "storage") && cage.InstanceJobID(filepath.Join(s.profile, "state"), "base-building") != "" {
 		if err := s.runCage("stop", "--keep-proxy", "base-building"); err != nil {
@@ -536,14 +579,14 @@ func (s *Server) stopEnvironment() (returned error) {
 	s.ready = false
 	s.credentials = guestCredentials{}
 	s.guestManifest = nil
-	s.guestUpdateRequired = false
-	s.macComponentsChecked = false
-	s.guestUpdateError = ""
+	s.setGuestUpdateLocked(false, "")
 	s.safety.Error = ""
 	s.mu.Unlock()
 	s.terminals.closeAll()
 	s.mobileCLI.stopAll()
 	s.closeProjectShares()
+	s.closeHostTools()
+	s.notifications.stopWatcher()
 	if _, err := os.Stat(filepath.Join(s.instanceDir(), "lima.yaml")); !containerenv.Configured(s.profile) && os.IsNotExist(err) {
 		return nil
 	}
@@ -554,7 +597,64 @@ func (s *Server) stopEnvironment() (returned error) {
 	}
 	return nil
 }
+
+// proxyDNSOutdated reports whether the core was configured with other DNS
+// endpoints than the saved settings (the environment's DoH list and the node
+// resolvers).
+func proxyDNSOutdated(p managedproxy.Store, cfg cage.Config) bool {
+	return !slices.Equal(p.CoreDNS(), cfg.DNSEndpoints()) || !slices.Equal(p.NodeResolvers(), cfg.BootstrapEndpoints())
+}
+
+var (
+	startPreflightProxy = managedproxy.StartPreflight
+	proxyCoreRunning    = managedproxy.Running
+)
+
+func needsBootstrapPreflight(old, candidate cage.Config, p managedproxy.Store) bool {
+	return !slices.Equal(old.BootstrapEndpoints(), candidate.BootstrapEndpoints()) ||
+		(p.Selected != "" && !slices.Equal(p.NodeResolvers(), candidate.BootstrapEndpoints()))
+}
+
+// probeCandidateLocation probes exit IP and location for candidate settings.
+// When the effective node bootstrap DNS differs from the saved config or the
+// active core's resolvers, it validates through an isolated temporary core so
+// replacing a failing bootstrap resolver can recover without touching the
+// active proxy or guest gate (#748).
+func (s *Server) probeCandidateLocation(ctx context.Context, old, candidate cage.Config, prefs Preferences) (Location, bool, error) {
+	p, err := managedproxy.Load(s.profile)
+	if err != nil {
+		return Location{}, false, err
+	}
+	probeCfg := candidate
+	usedPreflight := false
+	if needsBootstrapPreflight(old, candidate, p) {
+		p.GuestDNS = candidate.DNSEndpoints()
+		p.BootstrapDNS = candidate.BootstrapEndpoints()
+		preflight, err := startPreflightProxy(ctx, s.profile, p)
+		if err != nil {
+			return Location{}, true, err
+		}
+		defer preflight.Close()
+		probeCfg.ProxyURL = preflight.Endpoint
+		usedPreflight = true
+	}
+	loc, err := probeEnvironmentLocation(ctx, probeCfg, prefs)
+	return loc, usedPreflight, err
+}
+
+type jobRecoveryError struct {
+	Recovery string
+	Err      error
+}
+
+func (e *jobRecoveryError) Error() string { return e.Err.Error() }
+func (e *jobRecoveryError) Unwrap() error { return e.Err }
+
 func (s *Server) apply(v savedProfile, validate bool) error {
+	return s.applyWithOptions(v, validate, false)
+}
+
+func (s *Server) applyWithOptions(v savedProfile, validate, saveStaticDraft bool) error {
 	old, err := loadConfig(s.configPath)
 	if err != nil {
 		return err
@@ -568,44 +668,62 @@ func (s *Server) apply(v savedProfile, validate bool) error {
 		resumeVersion = execution.pauseVersion
 	}
 	wasReady := vmAlive(s.profile, s.environmentDir())
-	if s.windowsGuest != nil {
-		wasReady = s.windowsState.Running
-	} else if s.macosGuest != nil {
-		wasReady = macOSInstanceRunning(s.instanceDir(), s.macosGuest.Backend)
-	}
 	s.mu.Unlock()
 	changed := old != v.Config || oldPrefs.AutoTimezone != v.Preferences.AutoTimezone || oldPrefs.AutoLanguage != v.Preferences.AutoLanguage
+	var pendingStaticDraftErr error
 	if changed && validate && old.RequireManagedProxy(s.profile) == nil {
 		s.setMessage("正在验证新出口，现有环境保持运行…")
-		loc, e := probeEnvironmentLocation(s.operationContext(), v.Config, v.Preferences)
-		if err := s.finishLocationProbe(v.Config, loc, e); err != nil {
-			return err
+		loc, usedPreflight, e := s.probeCandidateLocation(s.operationContext(), old, v.Config, v.Preferences)
+		if !usedPreflight {
+			if err := s.finishLocationProbe(v.Config, loc, e); err != nil {
+				return err
+			}
 		}
 		if e != nil {
-			if v.Preferences.AutoTimezone || v.Preferences.AutoLanguage || loc.IP == "" {
+			if loc.IP == "" {
+				manualStatic := v.Config.ExitPolicy.Mode == "static" && v.Config.ExitPolicy.IP != ""
+				staticChanged := v.Config.ExitPolicy.Mode == "static" && v.Config.ExitPolicy != old.ExitPolicy
+				staticAllowed := false
+				if manualStatic {
+					countryState, countryMsg := exitpolicy.CheckExitCountry(v.Config.ExitPolicy.IP, nil)
+					if countryState == cage.CheckFailed {
+						return errors.New("静态 IP 基准未保存：" + countryMsg)
+					}
+					staticAllowed = true
+				}
+				if saveStaticDraft && staticAllowed {
+					// Offline static draft never treats manual input as live
+					// observation evidence and never authorizes outbound traffic.
+					v.Config.Timezone, v.Config.Locale, v.Config.BrowserLanguage = old.Timezone, old.Locale, old.BrowserLanguage
+					pendingStaticDraftErr = e
+				} else {
+					if staticChanged {
+						errMsg := fmt.Errorf("静态 IP 基准未保存，原规则保持不变：%w", e)
+						if staticAllowed {
+							return &jobRecoveryError{Recovery: "static-ip-draft-available", Err: errMsg}
+						}
+						return errMsg
+					}
+					return e
+				}
+			} else if v.Preferences.AutoTimezone || v.Preferences.AutoLanguage {
 				return e
 			}
 		} else {
 			v.Config = autoRegionSettings(v.Config, v.Preferences, loc)
 		}
-		v.Config.ExitPolicy = v.Config.ExitPolicy.BindMissing(loc.exitLocation())
-		observed := loc.exitLocation()
-		if result, message := v.Config.ExitPolicy.Evaluate(loc.IP, &observed); result != cage.CheckPassed {
-			if result == cage.CheckUnknown && e != nil && !v.Preferences.AutoTimezone && !v.Preferences.AutoLanguage {
-				return errors.New("时区和语言已选择手动设置，但所有出口仍须确认国家或地区。请重试位置检测或切换节点；静态 IP 和不限地区不能跳过大陆出口检查，原配置保持不变")
+		if pendingStaticDraftErr == nil {
+			v.Config.ExitPolicy = v.Config.ExitPolicy.BindMissing(loc.exitLocation())
+			observed := loc.exitLocation()
+			if result, message := v.Config.ExitPolicy.Evaluate(loc.IP, &observed); result != cage.CheckPassed {
+				if result == cage.CheckUnknown && e != nil && !v.Preferences.AutoTimezone && !v.Preferences.AutoLanguage {
+					return errors.New("时区和语言已选择手动设置，但所有出口仍须确认国家或地区。请重试位置检测或切换节点；静态 IP 和不限地区不能跳过大陆出口检查，原配置保持不变")
+				}
+				return errors.New(message)
 			}
-			return errors.New(message)
 		}
 	}
 	if changed {
-		if s.windowsGuest != nil && wasReady && (old.Timezone != v.Config.Timezone || old.Locale != v.Config.Locale) {
-			if err := s.closeProxyGate("正在应用 Windows 系统设置，外网等待重新检查"); err != nil {
-				return err
-			}
-			if err := s.applyWindowsGuestSettings(s.operationContext(), v.Config); err != nil {
-				return err
-			}
-		}
 		if err := s.resumeNetworkIntentAt(resumeVersion); err != nil {
 			return err
 		}
@@ -615,8 +733,14 @@ func (s *Server) apply(v savedProfile, validate bool) error {
 		if err = writePrivate(filepath.Join(s.profile, "previous-profile.json"), savedProfile{old, oldPrefs}); err != nil {
 			return err
 		}
+		if err = cage.SaveDNSOptionsFile(filepath.Join(s.profile, previousDNSFile), old.DNS); err != nil {
+			return err
+		}
 		if err = s.stopEnvironment(); err != nil {
 			return err
+		}
+		if pendingStaticDraftErr != nil {
+			_ = s.closeProxyGate("已保存待验证的静态 IP 基准，实时出口与完整检查通过前外网保持关闭")
 		}
 	}
 	// A project is a live directory grant in the same VM, never a lifecycle change.
@@ -626,18 +750,38 @@ func (s *Server) apply(v savedProfile, validate bool) error {
 			return err
 		}
 	}
+	loginPrefsCommitted := false
+	if !changed && oldPrefs.ReuseClaudeLogin != v.Preferences.ReuseClaudeLogin && s.vmRunning() {
+		if err := s.syncLoginPreferences(s.operationContext(), v.Preferences.ReuseClaudeLogin); err != nil {
+			return err
+		}
+		defer func() {
+			if !loginPrefsCommitted {
+				_ = s.syncLoginPreferences(s.operationContext(), oldPrefs.ReuseClaudeLogin)
+			}
+		}()
+	}
 	if v.Config.RequireManagedProxy(s.profile) == nil {
 		err = s.saveExitPolicyConfig(v.Config)
 	} else {
 		err = writePrivate(s.configPath, v.Config)
+	}
+	if err == nil {
+		// Older versions reject unknown configuration fields, so the extra
+		// resolvers live in their own file beside the configuration.
+		if err = cage.SaveDNSOptions(s.configPath, v.Config.DNS); err != nil {
+			_ = writePrivate(s.configPath, old)
+		}
 	}
 	if err != nil {
 		return err
 	}
 	if err = writePrivate(filepath.Join(s.profile, "workbench.json"), v.Preferences); err != nil {
 		_ = writePrivate(s.configPath, old)
+		_ = cage.SaveDNSOptions(s.configPath, old.DNS)
 		return err
 	}
+	loginPrefsCommitted = true
 	s.mu.Lock()
 	s.preferences = v.Preferences
 	token, ready := s.credentials.Token, s.ready
@@ -659,29 +803,38 @@ func (s *Server) apply(v savedProfile, validate bool) error {
 			}
 			return fmt.Errorf("设置已保存，环境尚未恢复就绪。请核对客机状态后重试启动：%w", err)
 		}
+	} else if changed && pendingStaticDraftErr == nil && v.Config.RequireManagedProxy(s.profile) == nil {
+		if p, loadErr := managedproxy.Load(s.profile); loadErr == nil && p.Selected != "" && p.Endpoint() == v.Config.ProxyURL && p.Revision == v.Config.ProxyRevision && proxyDNSOutdated(p, v.Config) && proxyCoreRunning(s.operationContext(), s.profile, p) {
+			s.setMessage("正在应用内置代理节点…")
+			if err = s.activateProxy(p, v.Config); err != nil {
+				return fmt.Errorf("设置已保存，但重启内置代理核心失败：%w", err)
+			}
+		}
+	}
+	if pendingStaticDraftErr != nil {
+		return staticDraftPendingError{fmt.Errorf("已保存待验证的静态 IP 基准（%s），外网保持关闭。待代理恢复后请重新检测联网，实时出口、国家与隔离检查全部通过前不会放行外网：%w", v.Config.ExitPolicy.IP, pendingStaticDraftErr)}
 	}
 	return nil
 }
 
-// Interface recovery uses the ordinary cancellable job queue. Location changes
-// remain governed by the saved exit policy and never replace its baseline.
-func (s *Server) monitorNetworkTick() {
-	timing := s.startMonitorTiming()
-	defer s.recordMonitorTiming("network", timing)
+func (s *Server) networkMonitorBlockedReason() string {
 	if s.storageRecoveryStatus().Required {
-		timing.result = "storage_recovery_pending"
+		return "storage_recovery_pending"
+	}
+	return ""
+}
+
+// Only this phase needs the lifecycle lock. Full safety observation runs in its
+// own loop, including while project operations hold the lifecycle lock.
+func (s *Server) monitorNetworkTick(observed proxyInterfaceObservation, timing *monitorTiming) {
+	if reason := s.networkMonitorBlockedReason(); reason != "" {
+		timing.result = reason
 		return
 	}
-	if s.macSetupPending() {
-		timing.result = "setup_pending"
-		return
-	}
-	s.monitorProxyInterface()
-	timing.stage("physical_interface")
+	s.applyProxyInterfaceObservation(observed)
+	timing.stage("physical_interface_apply")
 	s.checkProxyHealth()
 	timing.stage("proxy_health")
-	s.monitorSafety()
-	timing.stage("safety")
 	s.recoverNetwork()
 	timing.stage("recovery")
 	s.refreshProxySubscriptions()
@@ -689,50 +842,76 @@ func (s *Server) monitorNetworkTick() {
 }
 
 func (s *Server) monitorNetwork(ctx context.Context) {
-	s.runNetworkMonitor(ctx, s.monitorNetworkTick)
+	runNetworkMonitor(ctx, func(skipped *int) { s.runNetworkMonitorTick(ctx, skipped) })
 }
 
-// Keep scheduling and lock ownership independent of the network probes so
-// concurrency tests can exercise the real loop without external I/O.
-func (s *Server) runNetworkMonitor(ctx context.Context, tick func()) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+func runNetworkMonitor(ctx context.Context, tick func(*int)) {
 	skipped := 0
 	for ctx.Err() == nil {
-		s.mu.Lock()
-		// Publish ownership with acquisition and give project requests
-		// waiting on this round a chance before the next tick takes the lock.
-		yielded := s.projectOperationWaiters > 0
-		acquired := !yielded && s.op.TryLock()
-		if acquired {
-			s.networkMonitorDone = make(chan struct{})
+		tick(&skipped)
+		// Start the interval after the round finishes so a slow probe never
+		// causes another round to start immediately.
+		timer := time.NewTimer(5 * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
 		}
-		s.mu.Unlock()
-		if acquired {
-			skipped = 0
-			tick()
+	}
+}
+
+func (s *Server) runNetworkMonitorTick(ctx context.Context, skipped *int) {
+	timing := s.startMonitorTiming()
+	defer s.recordMonitorTiming("network", timing)
+	if reason := s.networkMonitorBlockedReason(); reason != "" {
+		*skipped = 0
+		timing.result = reason
+		return
+	}
+	observed := s.observeProxyInterface(ctx)
+	timing.stage("physical_interface")
+	if ctx.Err() != nil {
+		timing.result = "cancelled"
+		return
+	}
+	s.withNetworkMonitorLock(timing, skipped, func() {
+		if ctx.Err() != nil {
+			timing.result = "cancelled"
+			return
+		}
+		s.monitorNetworkTick(observed, timing)
+	})
+}
+
+func (s *Server) withNetworkMonitorLock(timing *monitorTiming, skipped *int, tick func()) {
+	s.mu.Lock()
+	// Publish ownership with acquisition so project requests can distinguish
+	// the monitor from a lifecycle operation and wait only for the former.
+	yielded := s.projectOperationWaiters > 0
+	acquired := !yielded && s.op.TryLock()
+	if acquired {
+		s.networkMonitorDone = make(chan struct{})
+	}
+	s.mu.Unlock()
+	switch {
+	case acquired:
+		*skipped = 0
+		defer func() {
 			s.mu.Lock()
 			s.op.Unlock()
 			close(s.networkMonitorDone)
 			s.networkMonitorDone = nil
 			s.mu.Unlock()
-		} else if yielded {
-			skipped = 0
-			timing := s.startMonitorTiming()
-			timing.result = "project_operations_waiting"
-			s.recordMonitorTiming("network", timing)
-		} else {
-			skipped++
-			timing := s.startMonitorTiming()
-			timing.result = "operation_lock_busy"
-			timing.stages = append(timing.stages, fmt.Sprintf("consecutive_lock_skips=%d", skipped))
-			s.recordMonitorTiming("network", timing)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
+		}()
+		tick()
+	case yielded:
+		*skipped = 0
+		timing.result = "project_operations_waiting"
+	default:
+		*skipped += 1
+		timing.result = "operation_lock_busy"
+		timing.stages = append(timing.stages, fmt.Sprintf("consecutive_lock_skips=%d", *skipped))
 	}
 }
 
@@ -764,13 +943,5 @@ func vmAlive(profile, workspace string) bool {
 	return processExists(record.PID) && cage.ProcessStartMatches(record.PID, record.Started)
 }
 func (s *Server) vmRunning() bool {
-	if s.windowsGuest != nil {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		return s.windowsState.Running
-	}
-	if s.macosGuest != nil {
-		return macOSInstanceRunning(s.instanceDir(), s.macosGuest.Backend)
-	}
 	return vmAlive(s.profile, s.environmentDir())
 }

@@ -10,6 +10,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/lima-vm/lima/v2/pkg/guestidentity"
 )
 
 type State struct {
@@ -41,6 +43,7 @@ type Inspection struct {
 
 type engineContainer struct {
 	ID    string `json:"Id"`
+	Name  string `json:"Name"`
 	Image string `json:"Image"`
 	State struct {
 		Running bool
@@ -121,28 +124,45 @@ func (w *limitedWriter) Write(data []byte) (int, error) {
 }
 
 func (r *Runtime) inspectContainer(ctx context.Context) (*engineContainer, error) {
-	// Query only this exact managed name. An empty result is absence, while
-	// engine/permission failures remain errors rather than triggering creation.
+	// Query containers matching this profile label, ignoring explicit device-reset
+	// archives (<name>-archive-<id>). An empty result is absence, while engine or
+	// permission failures remain errors rather than triggering creation.
 	data, err := r.output(ctx, "container", "ls", "--all", "--filter", "label="+profileLabel+"="+r.identity, "--format", "{{.ID}}")
 	if err != nil {
 		return nil, err
 	}
-	id := strings.TrimSpace(string(data))
-	if id == "" {
+	ids := strings.Fields(string(data))
+	if len(ids) == 0 {
 		return nil, nil
 	}
-	if strings.ContainsAny(id, " \r\n\t") {
-		return nil, errors.New("容器标识不唯一")
-	}
-	data, err = r.output(ctx, "container", "inspect", id)
+	inspectArgs := append([]string{"container", "inspect"}, ids...)
+	data, err = r.output(ctx, inspectArgs...)
 	if err != nil {
 		return nil, err
 	}
 	var found []engineContainer
-	if json.Unmarshal(data, &found) != nil || len(found) != 1 || found[0].Config.Labels[profileLabel] != r.identity {
+	if json.Unmarshal(data, &found) != nil || len(found) == 0 {
 		return nil, errors.New("容器身份与当前 Cage 配置不匹配")
 	}
-	return &found[0], nil
+	archivePrefix := r.Name() + "-archive-"
+	var active []engineContainer
+	for _, entry := range found {
+		if entry.Config.Labels[profileLabel] != r.identity {
+			return nil, errors.New("容器身份与当前 Cage 配置不匹配")
+		}
+		trimmed := strings.TrimPrefix(entry.Name, "/")
+		if strings.HasPrefix(trimmed, archivePrefix) {
+			continue
+		}
+		active = append(active, entry)
+	}
+	if len(active) == 0 {
+		return nil, nil
+	}
+	if len(active) > 1 {
+		return nil, errors.New("容器标识不唯一")
+	}
+	return &active[0], nil
 }
 
 func (r *Runtime) State(ctx context.Context) (State, error) {
@@ -251,14 +271,21 @@ func (r *Runtime) engineSecurity(ctx context.Context) (rootless, limited bool, e
 	return lines[0] == "true", lines[1] == "systemd" && (lines[2] == "v2" || lines[2] == "2"), nil
 }
 
+const legacyContainerHostname = "cage"
+
 func checkContainerConfiguration(container *engineContainer) error {
 	identity, err := containerIdentity(container)
 	if err != nil {
 		return err
 	}
-	hostname := "cage"
+	// Only pre-guestidentity legacy containers omit the identity label.
+	// Newly created containers always persist a randomized guestidentity label
+	// (verified by checkCreatedContainer) and never fall back to this value.
+	hostname := container.Config.Hostname
 	if identity != nil {
 		hostname = identity.Hostname
+	} else if hostname == "" {
+		hostname = legacyContainerHostname
 	}
 	config := container.HostConfig
 	if config.Privileged || config.NetworkMode != "none" || (config.PidMode != "" && config.PidMode != "private") || config.IpcMode != "private" || config.CgroupnsMode != "private" {
@@ -289,6 +316,22 @@ func checkContainerConfiguration(container *engineContainer) error {
 		}
 	}
 	return nil
+}
+
+// checkCreatedContainer verifies that a newly created container persisted its
+// randomized guest identity and did not silently fall back to legacy defaults.
+func checkCreatedContainer(container *engineContainer, expected *guestidentity.Identity) error {
+	if container == nil {
+		return errors.New("容器创建后未能验证身份")
+	}
+	actual, err := containerIdentity(container)
+	if err != nil {
+		return err
+	}
+	if actual == nil || expected == nil || actual.Hostname != expected.Hostname || actual.UUID != expected.UUID {
+		return errors.New("容器创建后缺少有效的随机客机身份")
+	}
+	return checkContainerConfiguration(container)
 }
 
 func (r *Runtime) Inspect(ctx context.Context) (Inspection, error) {

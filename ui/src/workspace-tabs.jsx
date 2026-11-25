@@ -13,10 +13,12 @@ import {
   Pin,
   PinOff,
   TerminalSquare,
+  UsersRound,
   X,
 } from "lucide-react";
-import { tabName } from "./workspace-state.mjs";
+import { dropAfter, tabName } from "./workspace-state.mjs";
 import { AgentIcon } from "./agent-icon";
+import { useTranslation } from "./interface-language.mjs";
 
 export function TabIcon({ kind, favicon, agent, accountNumber, size = 16 }) {
   const [failed, setFailed] = useState("");
@@ -34,7 +36,6 @@ export function TabIcon({ kind, favicon, agent, accountNumber, size = 16 }) {
 function TerminalAction({ label, icon: Icon, disabled, onClick }) {
   return (
     <button className="icon-button" aria-label={label} disabled={disabled} onClick={onClick}>
-      <span className="terminal-action-label" aria-hidden="true">{label}</span>
       <Icon size={14} />
     </button>
   );
@@ -56,10 +57,13 @@ export function WorkspaceTabs({
   onRename,
   onPin,
   onReorder,
+  onSidebarReorder,
   splitDrag,
   openingSession,
   sessionOpenError,
+  onSessionAccount,
 }) {
+  const tr = useTranslation();
   const [menu, setMenu] = useState(null);
   const [drag, setDrag] = useState(null);
   const [allOpen, setAllOpen] = useState(false);
@@ -91,13 +95,19 @@ export function WorkspaceTabs({
   const tabWidth = (id) =>
     id === active ? activeWidth : Math.min(220, otherWidth);
   const matchingTabs = tabs.filter((tab) =>
-    `${tabName(tab, saved)} ${tab.url || ""}`
+    `${tabName(tab, saved, undefined, tr)} ${tab.url || ""}`
       .toLowerCase()
       .includes(query.toLowerCase()),
   );
   const firstFocusable = tabs.findIndex(tab => tab.historySession
     ? !busy && openingSession !== tab.cli_session_id && !tab.sessionRunningElsewhere
     : ready || tab.kind === "terminal");
+  const sidebarDrop = (clientX, clientY, from) => {
+    const row = document.elementFromPoint(clientX, clientY)?.closest("[data-tab-id]");
+    const to = row?.dataset.tabId;
+    if (!to || to === from || row.parentElement !== list.current) return null;
+    return { to, after: dropAfter(row, clientY) };
+  };
   const finishDrag = (commit, event) => {
     const current = pointer.current;
     pointer.current = null;
@@ -108,6 +118,11 @@ export function WorkspaceTabs({
     if (!commit) return;
     const { clientX, clientY } = event;
     if (!tabs.find(tab => tab.id === current.id)?.historySession && splitDrag.drop(current.id, clientX, clientY)) return;
+    if (onSidebarReorder) {
+      const drop = sidebarDrop(clientX, clientY, current.id);
+      if (drop) onSidebarReorder(current.id, drop.to, drop.after);
+      return;
+    }
     const over = document.elementFromPoint(clientX, clientY);
     if (!list.current?.contains(over)) return;
     if (horizontal) onReorder(current.id, null, current.order);
@@ -154,7 +169,8 @@ export function WorkspaceTabs({
     current.moved = true;
     const dropSide = tabs.find(tab => tab.id === current.id)?.historySession ? null : splitDrag.hover(current.id, event.clientX, event.clientY);
     if (!horizontal || dropSide) {
-      setDrag({ id: current.id, offsets: {}, widths: {} });
+      const drop = onSidebarReorder && !dropSide ? sidebarDrop(event.clientX, event.clientY, current.id) : null;
+      setDrag({ id: current.id, drop, offsets: {}, widths: {} });
       return;
     }
     const item = current.items.find(item => item.id === current.id);
@@ -240,7 +256,7 @@ export function WorkspaceTabs({
   const actions = menu && (
     <div className="menu workspace-tab-menu"
       style={{ top: menu.top, left: menu.left }}
-      role="menu" aria-label="标签操作">
+      role="menu" aria-label={tr("标签操作")}>
               <button
                 role="menuitem"
                 onClick={() => {
@@ -248,7 +264,7 @@ export function WorkspaceTabs({
                   onRename(menu.tab);
                 }}
               >
-                重命名标签
+                {tr("重命名标签")}
               </button>
               <button
                 role="menuitem"
@@ -258,7 +274,7 @@ export function WorkspaceTabs({
                 }}
               >
                 <Pin size={14} />
-                {saved[menu.tab.id]?.pinned ? "取消置顶" : "置顶标签"}
+                {saved[menu.tab.id]?.pinned ? tr("取消置顶") : tr("置顶标签")}
               </button>
               <button
                 role="menuitem"
@@ -268,7 +284,7 @@ export function WorkspaceTabs({
                 }}
               >
                 <X size={15} />
-                关闭标签<kbd>{shortcut("⌘W")}</kbd>
+                {tr("关闭标签")}<kbd>{shortcut("⌘W")}</kbd>
               </button>
     </div>
   );
@@ -295,12 +311,12 @@ export function WorkspaceTabs({
         }
       >
         {tabs.map((tab, index) => {
-          const title = tabName(tab, saved);
+          const title = tabName(tab, saved, undefined, tr);
           const opening = Boolean(openingSession) && openingSession === tab.cli_session_id;
           const runningElsewhere = tab.sessionRunningElsewhere;
-          const runningNotice = tab.sessionClaudeDesktop
+          const runningNotice = tr(tab.sessionClaudeDesktop
             ? "Claude Desktop 占用中，请先在 Claude Desktop 中退出此会话再接续"
-            : "其他窗口占用中，退出原会话后可接续";
+            : "其他窗口占用中，退出原会话后可接续");
           const OwnerIcon = tab.sessionClaudeDesktop ? Monitor : TerminalSquare;
           const openError = tab.historySession && sessionOpenError?.id === tab.cli_session_id ? sessionOpenError.message : "";
           const errorID = `session-open-error-${tab.cli_session_id}`;
@@ -308,6 +324,7 @@ export function WorkspaceTabs({
             <React.Fragment key={tab.id}>
             <div
               data-tab-id={tab.id}
+              data-drop-position={drag?.drop?.to === tab.id ? drag.drop.after ? "after" : "before" : undefined}
               className={`${horizontal || vertical ? "browser-tab" : "sidebar-tab"} ${runningElsewhere ? "session-occupied" : ""} ${tab.id === active ? "active" : ""} ${tab.closed ? "ended" : ""} ${drag?.id === tab.id ? "dragging" : ""} ${horizontal && tabWidth(tab.id) < 96 ? "compact" : ""} ${horizontal && tabWidth(tab.id) < 40 ? "tiny" : ""} ${horizontal && tabWidth(tab.id) < 24 ? "sliver" : ""}`}
               style={
                 horizontal
@@ -327,7 +344,7 @@ export function WorkspaceTabs({
                 if (pointer.current) finishDrag(false);
               }}
               onClickCapture={(event) => {
-                if (suppressClick.current) {
+                if (event.detail && suppressClick.current) {
                   event.preventDefault();
                   event.stopPropagation();
                   suppressClick.current = false;
@@ -342,6 +359,7 @@ export function WorkspaceTabs({
                 aria-description={runningElsewhere ? runningNotice : undefined}
                 aria-label={tab.claudeLabel ? `${title} · ${tab.claudeLabel}` : title}
                 aria-selected={tab.historySession ? undefined : tab.id === active}
+                aria-keyshortcuts={onSidebarReorder && tabs.length > 1 ? "Alt+ArrowUp Alt+ArrowDown" : undefined}
                 tabIndex={
                   tab.id === active ||
                   (!tabs.some((t) => t.id === active) && index === firstFocusable)
@@ -349,14 +367,19 @@ export function WorkspaceTabs({
                     : -1
                 }
                 disabled={tab.historySession ? busy || opening || runningElsewhere : !ready && tab.kind !== "terminal"}
-                title={runningElsewhere ? `${title}\n${runningNotice}` : tab.url ? `${title}\n${tab.url}` : [title, tab.claudeAccountNumber && `账号 ${tab.claudeAccountNumber}`, tab.claudeLabel].filter(Boolean).join(" · ")}
+                title={runningElsewhere ? `${title}\n${runningNotice}` : tab.url ? `${title}\n${tab.url}` : [title, tab.claudeAccountNumber && tr("账号 {0}", tab.claudeAccountNumber), tab.claudeLabel].filter(Boolean).join(" · ")}
                 onClick={() => onSelect(tab.id)}
                 onContextMenu={(event) => showMenu(tab, event)}
                 onKeyDown={(event) => {
-                  if (!horizontal && !vertical && event.altKey && ["ArrowUp", "ArrowDown"].includes(event.key)) {
+                  if (onSidebarReorder && event.altKey && ["ArrowUp", "ArrowDown"].includes(event.key)) {
                     event.preventDefault();
-                    const target = tabs[index + (event.key === "ArrowUp" ? -1 : 1)];
-                    if (target) onReorder(tab.id, target.id);
+                    const after = event.key === "ArrowDown";
+                    const target = tabs[index + (after ? 1 : -1)];
+                    if (target) {
+                      onSidebarReorder(tab.id, target.id, after);
+                      const button = event.currentTarget;
+                      requestAnimationFrame(() => button.focus());
+                    }
                     return;
                   }
                   if (event.key === "F10" && event.shiftKey) {
@@ -390,7 +413,7 @@ export function WorkspaceTabs({
                 {tab.claudeLabel && <small className="claude-tab-profile">{tab.claudeLabel}</small>}
                 {saved[tab.id]?.pinned && <Pin size={11} className="tab-pin" />}
                 {!horizontal && !vertical && (opening || tab.sessionActive && !runningElsewhere) &&
-                  <LoaderCircle size={13} className="spin session-activity" role="img" aria-label={opening ? "正在打开会话" : "会话正在运行"} />}
+                  <LoaderCircle size={13} className="spin session-activity" role="img" aria-label={opening ? tr("正在打开会话") : tr("会话正在运行")} />}
               </button>
               {!horizontal && !vertical && runningElsewhere &&
                 <span className="session-owner" role="img" aria-label={runningNotice} tabIndex={0}>
@@ -399,18 +422,21 @@ export function WorkspaceTabs({
               {horizontal || vertical ? (
                 <button
                   className="tab-close icon-button"
-                  aria-label={`关闭 ${title}`}
+                  aria-label={tr("关闭 {0}", (title))}
                   disabled={busy}
                   onClick={() => onClose(tab)}
                 >
                   <X size={14} />
                 </button>
               ) : (
-                <div className="terminal-row-actions" role="group" aria-label={`${title} 的操作`}>
-                  <TerminalAction label={saved[tab.id]?.pinned ? "取消置顶" : "置顶"}
+                <div className="terminal-row-actions" role="group" aria-label={tr("{0} 的操作", (title))}>
+                  {tab.historySession && !runningElsewhere && onSessionAccount && tab.historySession.account_id && (
+                    <TerminalAction label={tr("用其他账号继续")} icon={UsersRound} disabled={busy || opening} onClick={() => onSessionAccount(tab.historySession)} />
+                  )}
+                  <TerminalAction label={saved[tab.id]?.pinned ? tr("取消置顶") : tr("置顶")}
                     icon={saved[tab.id]?.pinned ? PinOff : Pin} disabled={busy} onClick={() => onPin(tab.id)} />
-                  <TerminalAction label="重命名" icon={Pencil} disabled={busy} onClick={() => onRename(tab)} />
-                  <TerminalAction label={tab.cli_session_id ? "归档" : "关闭终端"} icon={tab.cli_session_id ? Archive : X} disabled={busy} onClick={event => onClose(tab, event.currentTarget)} />
+                  <TerminalAction label={tr("重命名")} icon={Pencil} disabled={busy} onClick={() => onRename(tab)} />
+                  <TerminalAction label={tab.cli_session_id && !tab.closed ? tr("归档") : tr("关闭终端")} icon={tab.cli_session_id && !tab.closed ? Archive : X} disabled={busy} onClick={event => onClose(tab, event.currentTarget)} />
                 </div>
               )}
             </div>
@@ -423,8 +449,8 @@ export function WorkspaceTabs({
         <div className="browser-all-tabs">
           <button
             className="icon-button"
-            aria-label="搜索标签页"
-            title="搜索标签页"
+            aria-label={tr("搜索标签页")}
+            title={tr("搜索标签页")}
             aria-expanded={allOpen}
             onClick={(event) => {
               trigger.current = event.currentTarget;
@@ -440,18 +466,18 @@ export function WorkspaceTabs({
               <div
                 className="menu all-tabs-menu"
                 role="dialog"
-                aria-label="搜索标签页"
+                aria-label={tr("搜索标签页")}
               >
                 <input
                   autoFocus
-                  aria-label="搜索已打开的标签页"
-                  placeholder="搜索标签页"
+                  aria-label={tr("搜索已打开的标签页")}
+                  placeholder={tr("搜索标签页")}
                   value={query}
                   onChange={(event) => setQuery(event.target.value)}
                 />
                 <div className="all-tabs-results">
                   {matchingTabs.length === 0 && (
-                    <p className="favorites-empty">没有匹配的标签页</p>
+                    <p className="favorites-empty">{tr("没有匹配的标签页")}</p>
                   )}
                   {matchingTabs.map((tab) => (
                     <button
@@ -465,9 +491,9 @@ export function WorkspaceTabs({
                       <TabIcon kind={tab.kind} favicon={tab.favicon}
                         agent={tab.terminalKind === "claude" || tab.terminalKind === "claude-login" || Boolean(tab.cli_session_id) || Boolean(tab.claude_account_id)}
                         accountNumber={tab.claudeAccountNumber} />
-                      <span>{tabName(tab, saved)}</span>
+                      <span>{tabName(tab, saved, undefined, tr)}</span>
                       {tab.id === active && (
-                        <span className="current-tab-marker">当前</span>
+                        <span className="current-tab-marker">{tr("当前")}</span>
                       )}
                     </button>
                   ))}

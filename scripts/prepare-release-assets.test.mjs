@@ -14,7 +14,6 @@ const names = {
   mac: `Cage-${version}-macos-arm64.dmg`,
   windows: `Cage-${version}-windows-amd64-setup.exe`,
   macSource: `mihomo-${macCore}-source.tar.gz`,
-  macGuestSource: `cage-macos-guest-${version}-source.tar.gz`,
   windowsSource: `mihomo-${dependencies.mihomo.version}-source.tar.gz`,
   qemu: `qemu-${dependencies.qemu.version}-windows-full-source.zip`,
 };
@@ -32,7 +31,7 @@ async function platform(directory, assets) {
   await writeFile(join(directory, 'SHA256SUMS'), Object.entries(assets).map(([name, data]) => `${digest(data)}  ${name}\n`).join(''));
 }
 
-const macAssets = () => ({ [names.mac]: 'mac package fixture', [names.macSource]: 'Mihomo source fixture', [names.macGuestSource]: 'macOS guest source fixture' });
+const macAssets = () => ({ [names.mac]: 'mac package fixture', [names.macSource]: 'Mihomo source fixture' });
 const windowsAssets = () => ({ [names.windows]: 'Windows package fixture', [names.windowsSource]: 'Mihomo source fixture', [names.qemu]: 'complete QEMU source fixture' });
 
 test('includes Linux deb only with its verified corresponding source and merges common sources', async t => {
@@ -48,6 +47,20 @@ test('includes Linux deb only with its verified corresponding source and merges 
   assert.ok(prepared.assets.includes(deb));
   assert.equal(await readFile(join(f.output, deb), 'utf8'), 'Linux package fixture');
   assert.equal(prepared.assets.filter(name => name === dependencies.mihomoSource.file).length, 1);
+});
+
+test('Intel Mac DMG shares the Apple Silicon Mihomo source', async t => {
+  const f = await fixture(t);
+  const intel = join(f.root, 'macos-intel');
+  const dmg = `Cage-${version}-macos-amd64.dmg`;
+  await platform(intel, { [dmg]: 'Intel Mac package fixture' });
+  // Without the Apple Silicon output, the Intel package has no source beside it.
+  await assert.rejects(prepareReleaseAssets({ inputs: [intel], output: f.output }), /Intel macOS release requires/);
+  await platform(f.mac, macAssets());
+  const prepared = await prepareReleaseAssets({ inputs: [f.mac, intel], output: f.output });
+  assert.ok(prepared.assets.includes(dmg) && prepared.assets.includes(names.mac));
+  assert.equal(prepared.assets.filter(name => name === names.macSource).length, 1);
+  assert.equal(await readFile(join(f.output, dmg), 'utf8'), 'Intel Mac package fixture');
 });
 
 test('combines both platforms, deduplicates identical sources and keeps website checksum lookup valid', async t => {
@@ -76,7 +89,7 @@ test('supports a single Windows or macOS platform with its corresponding sources
   const f = await fixture(t);
   await platform(f.mac, macAssets());
   await platform(f.windows, windowsAssets());
-  assert.equal((await prepareReleaseAssets({ inputs: [f.mac], output: f.output })).assets.length, 3);
+  assert.equal((await prepareReleaseAssets({ inputs: [f.mac], output: f.output })).assets.length, 2);
   assert.equal((await prepareReleaseAssets({ inputs: [f.windows], output: join(f.root, 'windows-only') })).assets.length, 3);
 });
 
@@ -126,13 +139,10 @@ test('requires Windows complete QEMU source in the same verified manifest', asyn
   await assert.rejects(prepareReleaseAssets({ inputs: [f.windows], output: f.output }), /complete QEMU source/);
 });
 
-test('requires the shipped macOS guest corresponding source in the verified manifest', async t => {
+test('rejects the source archive of the removed macOS guest', async t => {
   const f = await fixture(t);
-  const assets = macAssets();
-  delete assets[names.macGuestSource];
-  await platform(f.mac, assets);
-  await writeFile(join(f.mac, names.macGuestSource), 'unlisted source is not verified');
-  await assert.rejects(prepareReleaseAssets({ inputs: [f.mac], output: f.output }), /macOS guest corresponding source/);
+  await platform(f.mac, { ...macAssets(), [`cage-macos-guest-${version}-source.tar.gz`]: 'macOS guest source fixture' });
+  await assert.rejects(prepareReleaseAssets({ inputs: [f.mac], output: f.output }), /Unsupported asset/);
 });
 
 test('rejects wrong versions and manifest paths outside the release directory', async t => {

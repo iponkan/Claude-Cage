@@ -4,58 +4,14 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"testing"
-
-	"github.com/sylvinus/agent-vm/internal/guestos"
 )
 
-func TestIntelMacRunningRequiresQEMUProcess(t *testing.T) {
-	s := testServer(t)
-	s.macosGuest = &guestos.MacOSProfile{Instance: "mac", User: "cage", Backend: guestos.MacOSQEMU}
-	dir := s.instanceDir()
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := loadConfig(s.configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cfg.RecordRunningAt(dir); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(dir, "qemu.pid")
-	for _, value := range []string{"", "not-a-pid", "0", "-1", "1", "999999999", strings.Repeat("2", 33)} {
-		if err := os.WriteFile(path, []byte(value), 0600); err != nil {
-			t.Fatal(err)
-		}
-		if s.vmRunning() {
-			t.Fatalf("live hostagent with invalid or exited QEMU %q was treated as running", value)
-		}
-	}
-	if err := os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())+"\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if !s.vmRunning() {
-		t.Fatal("live QEMU process was not recognized")
-	}
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	if s.vmRunning() {
-		t.Fatal("QEMU exit left the environment running")
-	}
-}
-
 func TestVMRecordWithReusedPIDIsNotRunning(t *testing.T) {
-	for _, guest := range []string{"linux", "macos"} {
+	for _, guest := range []string{"linux"} {
 		t.Run(guest, func(t *testing.T) {
 			s := testServer(t)
 			s.preferences.Workspace, _ = filepath.EvalSymlinks(t.TempDir())
-			if guest == "macos" {
-				s.macosGuest = &guestos.MacOSProfile{Instance: "mac", User: "cage"}
-			}
 			dir := s.instanceDir()
 			if err := os.MkdirAll(dir, 0700); err != nil {
 				t.Fatal(err)
@@ -101,5 +57,42 @@ func TestVMRecordWithReusedPIDIsNotRunning(t *testing.T) {
 				t.Fatal("legacy PID-only record was rejected")
 			}
 		})
+	}
+}
+
+func TestUnreadableVMRecordNamesNoOwner(t *testing.T) {
+	s := testServer(t)
+	dir := filepath.Join(s.profile, "state", "lima", "interrupted")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, content := range []string{"", `{"pid":`} {
+		if err := os.WriteFile(filepath.Join(dir, "cage-running.json"), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if owners, err := controllerVMOwners(s.profile); err != nil || len(owners) != 0 {
+			t.Fatalf("record %q: owners = %v, %v", content, owners, err)
+		}
+		if controllerHasVM(s.profile) {
+			t.Fatalf("record %q reported a running environment", content)
+		}
+	}
+}
+
+// A complete record without a usable PID is refused rather than read as no
+// owner: only an empty or cut-off file comes from an interrupted write.
+func TestValidVMRecordWithoutPIDIsRefused(t *testing.T) {
+	s := testServer(t)
+	dir := filepath.Join(s.profile, "state", "lima", "damaged")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, content := range []string{`{"pid":0}`, `{"pid":-1,"started":"x"}`, `{}`, `{"pid":"12"}`} {
+		if err := os.WriteFile(filepath.Join(dir, "cage-running.json"), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if owners, err := controllerVMOwners(s.profile); err == nil {
+			t.Fatalf("record %q: owners = %v, want an error", content, owners)
+		}
 	}
 }

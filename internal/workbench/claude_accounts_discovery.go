@@ -3,7 +3,7 @@ package workbench
 import (
 	"context"
 	"errors"
-	"strings"
+	"slices"
 	"time"
 )
 
@@ -21,15 +21,21 @@ type claudeDetected struct {
 	UsageChecking  bool         `json:"usage_checking,omitempty"`
 }
 
+// The panel adds runtime-only fields to the saved account entries.
+type claudePanelAccount struct {
+	claudeAccount
+	Notices []claudeAccountNotice `json:"notices,omitempty"`
+}
+
 type claudePanel struct {
-	Scheduling             claudeScheduling `json:"scheduling"`
-	UsagePanelRunning      bool             `json:"usage_panel_running"`
-	UsageUnavailableReason string           `json:"usage_unavailable_reason,omitempty"`
-	Accounts               []claudeAccount  `json:"accounts"`
-	Detected               *claudeDetected  `json:"detected,omitempty"`
-	DetectionStatus        string           `json:"detection_status"`
-	DetectionError         string           `json:"detection_error,omitempty"`
-	LoginNotice            string           `json:"login_notice,omitempty"`
+	Scheduling             claudeScheduling     `json:"scheduling"`
+	UsagePanelRunning      bool                 `json:"usage_panel_running"`
+	UsageUnavailableReason string               `json:"usage_unavailable_reason,omitempty"`
+	Accounts               []claudePanelAccount `json:"accounts"`
+	Detected               *claudeDetected      `json:"detected,omitempty"`
+	DetectionStatus        string               `json:"detection_status"`
+	DetectionError         string               `json:"detection_error,omitempty"`
+	LoginNotice            string               `json:"login_notice,omitempty"`
 }
 
 func (s *Server) probeClaude(ctx context.Context, guestID string) (claudeGuestSnapshot, error) {
@@ -89,28 +95,27 @@ func (s *Server) inspectClaudeDefault(parent context.Context, force bool) (claud
 	defer m.mu.Unlock()
 	if ctx.Err() != nil || epoch.Err() != nil || err != nil {
 		reading = empty
-		err = errors.New("暂时无法读取环境的默认登录，请确认 Claude Code 和环境组件可用后重试")
+		var classified *accountProbeError
+		switch {
+		case epoch.Err() != nil:
+			err = errors.New("暂时无法读取环境的默认登录，请确认 Claude Code 和环境组件可用后重试")
+		case errors.Is(err, errAccountRouteFailed) || errors.Is(err, errUnsupportedAccountNetwork):
+			// Preserve route / capability error details.
+		case errors.As(err, &classified) && classified.message != "":
+			err = classified
+		default:
+			err = errors.New("暂时无法读取环境的默认登录，请确认 Claude Code 和环境组件可用后重试")
+		}
 	} else {
 		list, loadErr := s.loadClaudeAccounts()
 		if loadErr != nil {
 			err = loadErr
 		} else {
-			if subject := reading.subject(); subject != "" && list.bySubject(subject) == nil {
-				m.rememberDetected(subject, reading, now)
-			}
-			changed := false
-			for i := range list.Accounts {
-				a := &list.Accounts[i]
-				if a.Source != "default" {
-					continue
+			if reading.subject() != "" || slices.ContainsFunc(list.Accounts, func(a claudeAccount) bool { return a.Source == "default" }) {
+				err = s.archiveDefaultIfAvailable(ctx, &list, reading, now, force)
+				if err == nil {
+					err = s.saveClaudeAccounts(list)
 				}
-				if err = list.observe(a.ID, reading, now); err != nil {
-					break
-				}
-				changed = true
-			}
-			if changed && err == nil {
-				err = s.saveClaudeAccounts(list)
 			}
 		}
 	}
@@ -119,31 +124,6 @@ func (s *Server) inspectClaudeDefault(parent context.Context, force bool) (claud
 		m.defaultChecked = time.Time{}
 	}
 	return reading, now, err
-}
-
-// Keep a small, process-local history for unjoined identities. Switching the
-// default login cannot expose another identity's readings or erase a recent
-// observation when the same user returns to the default directory.
-func (m *claudeAccountManager) rememberDetected(subject string, reading claudeGuestSnapshot, now time.Time) {
-	if m.detectedUsage == nil {
-		m.detectedUsage = make(map[string]*claudeAccount)
-	}
-	a := m.detectedUsage[subject]
-	if a == nil {
-		if len(m.detectedUsage) >= 16 {
-			oldest := ""
-			for key, entry := range m.detectedUsage {
-				if oldest == "" || entry.CheckedAt < m.detectedUsage[oldest].CheckedAt {
-					oldest = key
-				}
-			}
-			delete(m.detectedUsage, oldest)
-		}
-		a = &claudeAccount{Email: reading.email(), Organization: reading.Organization}
-		m.detectedUsage[subject] = a
-	}
-	a.CheckedAt = now.Unix()
-	a.mergeQuota(reading.Quota, now)
 }
 
 func (s *Server) joinClaudeDefault(ctx context.Context, expected string) error {
@@ -165,19 +145,15 @@ func (s *Server) joinClaudeDefault(ctx context.Context, expected string) error {
 	if err != nil {
 		return err
 	}
-	if list.bySubject(expected) != nil {
+	a := list.bySubject(expected)
+	if a == nil {
+		return errors.New("登录身份尚未归档")
+	}
+	if a.Source != "default" || a.Enabled {
 		return nil
 	}
-	id := randomToken()[:24]
-	list.Accounts = append(list.Accounts, claudeAccount{ID: id, Source: "default", Label: reading.email(), Enabled: true})
-	if err := list.observe(id, reading, now); err != nil {
-		return err
-	}
-	if cached := m.detectedUsage[expected]; cached != nil {
-		a := list.find(id)
-		a.mergeQuota(cached.Quota, now)
-		a.UsageCheckedAt, a.UsageStatus = cached.UsageCheckedAt, cached.UsageStatus
-	}
+	a.Enabled = true
+	a.CheckedAt = now.Unix()
 	return s.saveClaudeAccounts(list)
 }
 
@@ -190,13 +166,12 @@ func (s *Server) claudePanelView(ctx context.Context) (claudePanel, claudeAccoun
 		view.UsageUnavailableReason = unavailable.Error()
 	}
 	var reading claudeGuestSnapshot
-	var checked time.Time
 	if update {
 		view.DetectionStatus = "update_required"
 		view.DetectionError = "请同步环境组件后再检测普通终端的登录"
 	} else if ready {
 		var err error
-		reading, checked, err = s.inspectClaudeDefault(ctx, false)
+		reading, _, err = s.inspectClaudeDefault(ctx, false)
 		if err != nil {
 			view.DetectionStatus, view.DetectionError = "unavailable", err.Error()
 		} else if reading.subject() == "" {
@@ -212,6 +187,10 @@ func (s *Server) claudePanelView(ctx context.Context) (claudePanel, claudeAccoun
 	if err != nil {
 		return view, list, err
 	}
+	var notices map[string][]claudeAccountNotice
+	if ready && !update {
+		notices = s.claudeAccountNotices(ctx, list.Accounts)
+	}
 	if ready && !update && list.PendingLogin != "" && !s.claudeLoginActive(list.PendingLogin) {
 		_ = s.recoverClaudePending(ctx, list.PendingLogin, false)
 	}
@@ -221,21 +200,14 @@ func (s *Server) claudePanelView(ctx context.Context) (claudePanel, claudeAccoun
 	if err != nil {
 		return view, list, err
 	}
-	view.Accounts, view.LoginNotice = list.Accounts, m.loginNotice
+	view.Accounts, view.LoginNotice = make([]claudePanelAccount, len(list.Accounts)), m.loginNotice
 	view.Scheduling = list.Scheduling
 	view.UsagePanelRunning = m.panelRunning
-	if subject := reading.subject(); view.DetectionStatus == "ready" && list.bySubject(subject) == nil {
-		view.Detected = &claudeDetected{Identity: subject, Email: reading.email(), Organization: strings.TrimSpace(reading.Organization), Plan: reading.Plan, Quota: reading.Quota, CheckedAt: checked.Unix()}
-	}
 	for i := range view.Accounts {
+		view.Accounts[i].claudeAccount = list.Accounts[i]
 		a := &view.Accounts[i]
 		a.UsageChecking = m.usageActive[claudeIdentityHash(a.Email, a.Organization)] != nil
-	}
-	if d := view.Detected; d != nil {
-		if stored := m.detectedUsage[d.Identity]; stored != nil {
-			d.Quota, d.UsageCheckedAt, d.UsageStatus = stored.Quota, stored.UsageCheckedAt, stored.UsageStatus
-		}
-		d.UsageChecking = m.usageActive[d.Identity] != nil
+		a.Notices = notices[a.guestID()]
 	}
 	return view, list, nil
 }

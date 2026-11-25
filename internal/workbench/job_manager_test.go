@@ -46,9 +46,11 @@ func TestJobManagerStopPreemptsAndFencesOldExecution(t *testing.T) {
 	var old *jobExecution
 	first, err := manager.submit(&operation, "start", 17, nil, nil, func() error {
 		old = manager.execution()
+		old.settingsSaved()
 		close(started)
 		<-old.ctx.Done()
 		old.message("stale message")
+		old.settingsSaved()
 		_, _ = old.Write([]byte("stale output"))
 		close(canceled)
 		return errors.New("stale error")
@@ -57,7 +59,7 @@ func TestJobManagerStopPreemptsAndFencesOldExecution(t *testing.T) {
 		t.Fatal(err)
 	}
 	awaitJobSignal(t, started)
-	if old.id != first.ID || old.pauseVersion != 17 {
+	if old.id != first.ID || old.pauseVersion != 17 || !manager.snapshot().SettingsSaved {
 		t.Fatal("execution lost admission identity or pause generation")
 	}
 	if _, err := manager.submit(&operation, "settings", 0, func() error {
@@ -76,8 +78,16 @@ func TestJobManagerStopPreemptsAndFencesOldExecution(t *testing.T) {
 	awaitJobSignal(t, canceled)
 	awaitJobSignal(t, stopped)
 	state := awaitJobIdle(t, &manager)
-	if state.ID != stop.ID || state.Error != "" || state.Log != "" || state.Message != "已完成" {
+	if state.ID != stop.ID || state.Error != "" || state.Log != "" || state.Message != "已完成" || state.SettingsSaved {
 		t.Fatalf("old execution changed stop result: %+v", state)
+	}
+	// The preempted job stays queryable as canceled and names its successor.
+	replaced, ok := manager.find(first.ID)
+	if !ok || replaced.Running || !replaced.Canceled || replaced.SupersededBy != stop.ID || replaced.Kind != "start" || replaced.Error != "" || !strings.Contains(replaced.Message, "停止环境") {
+		t.Fatalf("preempted job lost its record: %+v %v", replaced, ok)
+	}
+	if _, ok := manager.find(""); ok {
+		t.Fatal("empty id matched a job")
 	}
 
 	// Retained writers must stay tied to their original job after later work
@@ -93,10 +103,11 @@ func TestJobManagerStopPreemptsAndFencesOldExecution(t *testing.T) {
 	}
 	awaitJobSignal(t, startedAgain)
 	old.message("late message")
+	old.settingsSaved()
 	_, _ = old.Write([]byte("late output"))
 	state = manager.snapshot()
 	close(release)
-	if state.Log != "" || state.Message != "正在准备…" {
+	if state.Log != "" || state.Message != "正在准备…" || state.SettingsSaved {
 		t.Fatalf("late output reached another job: %+v", state)
 	}
 }
@@ -319,4 +330,73 @@ func TestJobManagerPreservesProjectRecovery(t *testing.T) {
 	if job.Error != "" || job.Recovery != "" || job.Workspace != "" {
 		t.Fatalf("stale recovery after retry: %+v", job)
 	}
+}
+
+func TestJobManagerRecordsInitiatorAndCancellationSource(t *testing.T) {
+	t.Run("superseded while running", func(t *testing.T) {
+		var manager jobManager
+		var operation sync.Mutex
+		defer manager.close()
+		started, canceled := make(chan struct{}), make(chan struct{})
+		first, err := manager.submitWithInitiator(&operation, "start", jobInitiatorAgent, 0, nil, nil, func() error {
+			close(started)
+			<-manager.execution().ctx.Done()
+			close(canceled)
+			return context.Canceled
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if first.Initiator != jobInitiatorAgent {
+			t.Fatalf("expected agent initiator, got %+v", first)
+		}
+		awaitJobSignal(t, started)
+		stop, err := manager.submitWithInitiator(&operation, "stop", jobInitiatorDesktop, 0, nil, nil, func() error {
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		awaitJobSignal(t, canceled)
+		state := awaitJobIdle(t, &manager)
+		if state.ID != stop.ID || state.Initiator != jobInitiatorDesktop {
+			t.Fatalf("stop job lost initiator: %+v", state)
+		}
+		replaced, ok := manager.find(first.ID)
+		if !ok || replaced.Initiator != jobInitiatorAgent || !replaced.Canceled || replaced.CanceledBy != jobInitiatorDesktop || replaced.SupersededBy != stop.ID {
+			t.Fatalf("superseded job missing initiator or cancellation source: %+v %v", replaced, ok)
+		}
+	})
+
+	t.Run("canceled before stop submitted", func(t *testing.T) {
+		var manager jobManager
+		var operation sync.Mutex
+		defer manager.close()
+		started := make(chan struct{})
+		first, err := manager.submitWithInitiator(&operation, "start", jobInitiatorAgent, 0, nil, nil, func() error {
+			close(started)
+			<-manager.execution().ctx.Done()
+			return context.Canceled
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		awaitJobSignal(t, started)
+		manager.cancelRunningBy(jobInitiatorSetup)
+		canceledState := awaitJobIdle(t, &manager)
+		if !canceledState.Canceled || canceledState.CanceledBy != jobInitiatorSetup || canceledState.Initiator != jobInitiatorAgent {
+			t.Fatalf("fast-canceled job lost cancellation source: %+v", canceledState)
+		}
+		stop, err := manager.submitWithInitiator(&operation, "stop", jobInitiatorSetup, 0, nil, nil, func() error {
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		awaitJobIdle(t, &manager)
+		replaced, ok := manager.find(first.ID)
+		if !ok || !replaced.Canceled || replaced.CanceledBy != jobInitiatorSetup || replaced.SupersededBy != stop.ID {
+			t.Fatalf("replaced fast-canceled job lost metadata: %+v %v", replaced, ok)
+		}
+	})
 }

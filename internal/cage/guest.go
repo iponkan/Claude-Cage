@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 
@@ -22,9 +23,6 @@ var tailnetClient string
 func tailnetClientScript() string {
 	return "sudo tee /usr/local/lib/tailnet-client.mjs >/dev/null <<'CAGE_TAILNET_CLIENT'\n" + tailnetClient + "\nCAGE_TAILNET_CLIENT\n"
 }
-
-//go:embed ubuntu-browser.sh
-var ubuntuBrowser string
 
 //go:embed guest-services.sh
 var guestServices string
@@ -56,6 +54,13 @@ sudo chmod 0755 /usr/local/lib/cage-claude-bin/claude
 
 //go:embed guest-audio.sh
 var guestAudio string
+
+//go:embed guest-audio-input.py
+var guestAudioInput string
+
+func guestAudioInputScript() string {
+	return "sudo tee /usr/local/bin/cage-audio-input >/dev/null <<'CAGE_AUDIO_INPUT'\n" + guestAudioInput + "\nCAGE_AUDIO_INPUT\nsudo chmod 0755 /usr/local/bin/cage-audio-input\n"
+}
 
 //go:embed guest-memory.sh
 var guestMemory string
@@ -103,6 +108,9 @@ var browserCookies string
 //go:embed browser-extensions.mjs
 var browserExtensions string
 
+//go:embed browser-history.mjs
+var browserHistory string
+
 //go:embed browser-extension-archive.py
 var browserExtensionArchive string
 
@@ -122,7 +130,7 @@ var browserSettingsPage string
 var splitControl string
 
 func splitExtensionScript() string {
-	return "split_directory=/usr/local/lib/cage-split\nif cage_is_ubuntu; then split_directory=/var/snap/chromium/common/workbench-extension; fi\nsudo install -d -m 0755 \"$split_directory\"\n" +
+	return "split_directory=/usr/local/lib/cage-split\nsudo install -d -m 0755 \"$split_directory\"\n" +
 		"sudo tee \"$split_directory\"/manifest.json >/dev/null <<'CAGE_MANIFEST'\n" + splitManifest + "\nCAGE_MANIFEST\n" +
 		"sudo tee \"$split_directory\"/control.html >/dev/null <<'CAGE_HTML'\n" + splitPage + "\nCAGE_HTML\n" +
 		"sudo tee \"$split_directory\"/settings.html >/dev/null <<'CAGE_SETTINGS_HTML'\n" + browserSettingsPage + "\nCAGE_SETTINGS_HTML\n" +
@@ -161,10 +169,6 @@ var imageInput string
 //go:embed desktop-files.py
 var desktopFiles string
 
-// DesktopFileReceiver shares the same bounded attachment writer with native
-// guests. Its --save-file mode uses only Python's standard library.
-func DesktopFileReceiver() string { return desktopFiles }
-
 //go:embed desktop-downloads.py
 var desktopDownloads string
 
@@ -200,7 +204,7 @@ func phoneBrowserScript() string {
 }
 
 func browserServices() string {
-	return deviceObservationScript() + "sudo tee /usr/local/lib/cage-wait-services.py >/dev/null <<'CAGE_WAIT_SERVICES'\n" + guestWaitServices + "\nCAGE_WAIT_SERVICES\n" + toolInstallFunctions() + "\n" + tailnetClientScript() + "sudo tee /usr/local/lib/browser-visibility.mjs >/dev/null <<'CAGE_BROWSER_VISIBILITY'\n" + browserVisibility + "\nCAGE_BROWSER_VISIBILITY\nsudo tee /usr/local/lib/browser-wheel.mjs >/dev/null <<'CAGE_BROWSER_WHEEL'\n" + browserWheel + "\nCAGE_BROWSER_WHEEL\nsudo tee /usr/local/lib/display-density.mjs >/dev/null <<'CAGE_DISPLAY_DENSITY'\n" + displayDensity + "\nCAGE_DISPLAY_DENSITY\n" + displayGovernorScript() + PhoneDesktopProvisionScript() + phoneBrowserScript() + "\nsudo tee /usr/local/lib/browser-extensions.mjs >/dev/null <<'CAGE_BROWSER_EXTENSIONS'\n" + browserExtensions + "\nCAGE_BROWSER_EXTENSIONS\n" + "\nsudo tee /usr/local/lib/browser-extension-archive.py >/dev/null <<'CAGE_EXTENSION_ARCHIVE'\n" + browserExtensionArchive + "\nCAGE_EXTENSION_ARCHIVE\n" + "\nsudo tee /usr/local/lib/browser-private.mjs >/dev/null <<'CAGE_BROWSER_PRIVATE'\n" + browserPrivate + "\nCAGE_BROWSER_PRIVATE\n" + "\nsudo tee /usr/local/lib/browser-cookies.mjs >/dev/null <<'CAGE_BROWSER_COOKIES'\n" + browserCookies + "\nCAGE_BROWSER_COOKIES\n" + "\nsudo tee /usr/local/lib/browser-vault.mjs >/dev/null <<'CAGE_BROWSER_VAULT'\n" + browserVault + "\nCAGE_BROWSER_VAULT\n" + guestMemory + "\n" + guestDiagnostics() + guestAudio + "\n" + guestOpenScript() + splitExtensionScript() + browserClipboardScript() + imageInputScript() + "\nsudo tee /usr/local/lib/browser-uploads.mjs >/dev/null <<'CAGE_BROWSER_UPLOADS'\n" + browserUploads + "\nCAGE_BROWSER_UPLOADS\n" + guestServices + "\nsudo tee /usr/local/lib/browser-downloads.mjs >/dev/null <<'CAGE_BROWSER_DOWNLOADS'\n" + browserDownloads + "\nCAGE_BROWSER_DOWNLOADS\n" + "\nsudo tee /usr/local/bin/cage-editor-migrate >/dev/null <<'CAGE_EDITOR_MIGRATE'\n" + editorMigrate + "\nCAGE_EDITOR_MIGRATE\nsudo chmod 0755 /usr/local/bin/cage-editor-migrate\n" + "\nsudo tee /usr/local/lib/browser-audit.mjs >/dev/null <<'CAGE_BROWSER_AUDIT'\n" + browserAudit + "\nCAGE_BROWSER_AUDIT\n" + "\nsudo tee /usr/local/lib/cage-browser-agent.mjs >/dev/null <<'CAGE_BROWSER_AGENT'\n" + browserAgent + "\nCAGE_BROWSER_AGENT\n" + "sudo tee /usr/local/bin/cage-save-download >/dev/null <<'CAGE_DOWNLOAD_HELPER'\n" + saveDownload + "\nCAGE_DOWNLOAD_HELPER\nsudo chmod 0755 /usr/local/bin/cage-save-download\nprintf 'cage-browser ALL=(root) NOPASSWD: /usr/local/bin/cage-save-download *\\n' | sudo tee /etc/sudoers.d/cage-download >/dev/null\nsudo chmod 0440 /etc/sudoers.d/cage-download\n" + "\nsudo python3 - \"$cage_novnc_root\" <<'CAGE_NOVNC_PATCH'\n" + novncPatch + "\nCAGE_NOVNC_PATCH\n" + "\nsudo tee \"$cage_novnc_root/cage-clipboard.js\" >/dev/null <<'CAGE_CLIPBOARD_JS'\n" + clipboardJS + "\nCAGE_CLIPBOARD_JS\n" + `sudo python3 - <<'PYCODE'
+	return deviceObservationScript() + "sudo tee /usr/local/lib/cage-wait-services.py >/dev/null <<'CAGE_WAIT_SERVICES'\n" + guestWaitServices + "\nCAGE_WAIT_SERVICES\n" + toolInstallFunctions() + "\n" + tailnetClientScript() + "sudo tee /usr/local/lib/browser-visibility.mjs >/dev/null <<'CAGE_BROWSER_VISIBILITY'\n" + browserVisibility + "\nCAGE_BROWSER_VISIBILITY\nsudo tee /usr/local/lib/browser-wheel.mjs >/dev/null <<'CAGE_BROWSER_WHEEL'\n" + browserWheel + "\nCAGE_BROWSER_WHEEL\nsudo tee /usr/local/lib/display-density.mjs >/dev/null <<'CAGE_DISPLAY_DENSITY'\n" + displayDensity + "\nCAGE_DISPLAY_DENSITY\n" + displayGovernorScript() + PhoneDesktopProvisionScript() + phoneBrowserScript() + "\nsudo tee /usr/local/lib/browser-extensions.mjs >/dev/null <<'CAGE_BROWSER_EXTENSIONS'\n" + browserExtensions + "\nCAGE_BROWSER_EXTENSIONS\n" + "\nsudo tee /usr/local/lib/browser-history.mjs >/dev/null <<'CAGE_BROWSER_HISTORY'\n" + browserHistory + "\nCAGE_BROWSER_HISTORY\n" + "\nsudo tee /usr/local/lib/browser-extension-archive.py >/dev/null <<'CAGE_EXTENSION_ARCHIVE'\n" + browserExtensionArchive + "\nCAGE_EXTENSION_ARCHIVE\n" + "\nsudo tee /usr/local/lib/browser-private.mjs >/dev/null <<'CAGE_BROWSER_PRIVATE'\n" + browserPrivate + "\nCAGE_BROWSER_PRIVATE\n" + "\nsudo tee /usr/local/lib/browser-cookies.mjs >/dev/null <<'CAGE_BROWSER_COOKIES'\n" + browserCookies + "\nCAGE_BROWSER_COOKIES\n" + "\nsudo tee /usr/local/lib/browser-vault.mjs >/dev/null <<'CAGE_BROWSER_VAULT'\n" + browserVault + "\nCAGE_BROWSER_VAULT\n" + guestMemory + "\n" + GuestDiskGrowScript + "\n" + guestDiagnostics() + guestAudioInputScript() + guestAudio + "\n" + guestOpenScript() + splitExtensionScript() + browserClipboardScript() + imageInputScript() + "\nsudo tee /usr/local/lib/browser-uploads.mjs >/dev/null <<'CAGE_BROWSER_UPLOADS'\n" + browserUploads + "\nCAGE_BROWSER_UPLOADS\n" + guestServices + "\nsudo tee /usr/local/lib/browser-downloads.mjs >/dev/null <<'CAGE_BROWSER_DOWNLOADS'\n" + browserDownloads + "\nCAGE_BROWSER_DOWNLOADS\n" + "\nsudo tee /usr/local/bin/cage-editor-migrate >/dev/null <<'CAGE_EDITOR_MIGRATE'\n" + editorMigrate + "\nCAGE_EDITOR_MIGRATE\nsudo chmod 0755 /usr/local/bin/cage-editor-migrate\n" + "\nsudo tee /usr/local/bin/cage-apply-theme >/dev/null <<'CAGE_APPLY_THEME'\n" + GuestThemeScript + "\nCAGE_APPLY_THEME\nsudo chmod 0755 /usr/local/bin/cage-apply-theme\n" + "\nif [ -f /usr/local/bin/cage-claude-session ]; then sudo tee /usr/local/bin/cage-claude-session >/dev/null <<'CAGE_CLAUDE_SESSION'\n" + claudeDesktopSession + "\nCAGE_CLAUDE_SESSION\nsudo chmod 0755 /usr/local/bin/cage-claude-session\nfi\n" + "\nsudo tee /usr/local/lib/browser-audit.mjs >/dev/null <<'CAGE_BROWSER_AUDIT'\n" + browserAudit + "\nCAGE_BROWSER_AUDIT\n" + "\nsudo tee /usr/local/lib/cage-browser-agent.mjs >/dev/null <<'CAGE_BROWSER_AGENT'\n" + browserAgent + "\nCAGE_BROWSER_AGENT\n" + "sudo tee /usr/local/bin/cage-save-download >/dev/null <<'CAGE_DOWNLOAD_HELPER'\n" + saveDownload + "\nCAGE_DOWNLOAD_HELPER\nsudo chmod 0755 /usr/local/bin/cage-save-download\nprintf 'cage-browser ALL=(root) NOPASSWD: /usr/local/bin/cage-save-download *\\n' | sudo tee /etc/sudoers.d/cage-download >/dev/null\nsudo chmod 0440 /etc/sudoers.d/cage-download\n" + "\nsudo python3 - \"$cage_novnc_root\" <<'CAGE_NOVNC_PATCH'\n" + novncPatch + "\nCAGE_NOVNC_PATCH\n" + "\nsudo tee \"$cage_novnc_root/cage-clipboard.js\" >/dev/null <<'CAGE_CLIPBOARD_JS'\n" + clipboardJS + "\nCAGE_CLIPBOARD_JS\n" + `sudo python3 - <<'PYCODE'
 from pathlib import Path
 import re
 p = Path("/usr/share/novnc/vnc.html")
@@ -220,6 +224,9 @@ var GuestSetup = APTBootstrapScript + "\n" + guestDependencies + "\n" + browserS
 
 //go:embed editor-theme.json
 var editorTheme string
+
+//go:embed guest-theme.py
+var GuestThemeScript string
 
 //go:embed guest-start.sh
 var guestStart string
@@ -247,7 +254,62 @@ var APTBootstrapScript = "set -e\nsudo env APT_CONFIG=\"${CAGE_APT_CONFIG:-/dev/
 
 // DebianPrepareScript runs before Lima's own dependency installation as well
 // as Cage setup. Its version check also covers previously created guests.
-var DebianPrepareScript = "#!/bin/sh\n" + APTBootstrapScript + "\n" + DebianMirrorsScript
+var DebianPrepareScript = DebianPrepareScriptFor("")
+
+// DebianMirrorEnv carries the workbench's Debian source choice to the host
+// cage CLI. It stays on the host: the guest receives the validated value as
+// a non-exported shell variable of the preparation script. The cloud image
+// build's CAGE_DEBIAN_MIRROR names a mirror URL instead, hence the distinct
+// name.
+const DebianMirrorEnv = "CAGE_DEBIAN_MIRROR_ORDER"
+
+// GuestThemeEnv carries the workbench's resolved light/dark variant into guest startup scripts.
+const GuestThemeEnv = "CAGE_GUEST_THEME"
+
+// InstallTLS12Env carries the user's explicit opt-in TLS 1.2 compatibility
+// switch to the host cage CLI. It stays on the host; when set to "1", setup
+// and tool-update subshells create a temporary CURL_HOME capped at TLS 1.2 so
+// curl avoids proxy egresses that drop TLS 1.3 ClientHello packets. It defaults
+// to off and never alters runtime browsing or API traffic.
+const InstallTLS12Env = "CAGE_INSTALL_TLS12_COMPAT"
+
+// InstallTLS12Prelude configures a temporary curl config capped at TLS 1.2 for
+// the current install or tool-update shell when enabled is true. When false
+// (the default), it emits nothing so TLS 1.3 stays active.
+func InstallTLS12Prelude(enabled bool) string {
+	if !enabled {
+		return ""
+	}
+	return `_curl_compat_home="$(mktemp -d)"
+printf 'tls-max = "1.2"\n' > "$_curl_compat_home/.curlrc"
+export CURL_HOME="$_curl_compat_home"
+trap 'rm -rf "$_curl_compat_home"' EXIT
+`
+}
+
+// ValidDebianMirror reports whether preference names a Debian source policy:
+// "auto" (official first), "official" (pinned), or "nju" / "ustc" (that
+// domestic mirror first, the other next, the official source last).
+func ValidDebianMirror(preference string) bool {
+	switch preference {
+	case "auto", "official", "nju", "ustc":
+		return true
+	}
+	return false
+}
+
+func debianMirrorChoice(preference string) string {
+	if !ValidDebianMirror(preference) {
+		return ""
+	}
+	return "debian_mirror_choice=" + preference + "\n"
+}
+
+// DebianPrepareScriptFor pins the source policy for this run. An empty or
+// unknown preference keeps the guest's saved choice or its default probe.
+func DebianPrepareScriptFor(preference string) string {
+	return "#!/bin/sh\n" + APTBootstrapScript + "\n" + debianMirrorChoice(preference) + DebianMirrorsScript
+}
 
 //go:embed chromium-download.py
 var chromiumDownload string
@@ -259,7 +321,12 @@ cage_curl_download() {
 ` + toolDownload + `
 CAGE_DOWNLOAD_IDLE
 }
-` + guestTools + "\n" + ubuntuBrowser
+` + guestTools + `
+cage_install_chromium() {
+  cage_cache_chromium --no-install-recommends chromium chromium-l10n
+  sudo env DEBIAN_FRONTEND=noninteractive APT_CONFIG="${CAGE_APT_CONFIG:-/dev/null}" apt-get install -y --no-install-recommends chromium chromium-l10n </dev/null
+}
+`
 }
 
 func ToolInstallPrelude() string {
@@ -276,7 +343,7 @@ CAGE_CHROMIUM_DOWNLOAD
 }
 
 func RequiredToolVersions() map[string]string {
-	result := map[string]string{"chromium": "Debian security repository / Ubuntu Chromium latest/stable"}
+	result := map[string]string{"chromium": "Debian security repository"}
 	for _, line := range strings.Split(toolVersions, "\n") {
 		key, value, ok := strings.Cut(line, "=")
 		if !ok {
@@ -295,8 +362,10 @@ func RequiredToolVersions() map[string]string {
 	return result
 }
 
-func ToolsUpdateScript() string {
-	return "set -euo pipefail\nexport PATH=\"$HOME/.local/bin:$PATH\"\n" + `
+func ToolsUpdateScript() string { return ToolsUpdateScriptFor(false) }
+
+func ToolsUpdateScriptFor(tls12Compat bool) string {
+	return "set -euo pipefail\nexport PATH=\"$HOME/.local/bin:$PATH\"\n" + InstallTLS12Prelude(tls12Compat) + `
 sudo env DEBIAN_FRONTEND=noninteractive dpkg --configure -a </dev/null
 ` + APTBootstrapScript + ToolInstallPrelude() + `
 sudo env DEBIAN_FRONTEND=noninteractive APT_CONFIG="${CAGE_APT_CONFIG:-/dev/null}" apt-get update </dev/null
@@ -312,7 +381,11 @@ printf 'Cage tool packages are ready; applying browser and editor components.\n'
 }
 
 func (c Config) EnvironmentScript() string {
-	return fmt.Sprintf("export CAGE_TZ=%s\nexport CAGE_LOCALE=%s\nexport CAGE_LANGUAGE=%s\n", shellescape.Quote(c.Timezone), shellescape.Quote(c.Locale), shellescape.Quote(c.BrowserLanguage)) + guestEnv
+	env := fmt.Sprintf("export CAGE_TZ=%s\nexport CAGE_LOCALE=%s\nexport CAGE_LANGUAGE=%s\n", shellescape.Quote(c.Timezone), shellescape.Quote(c.Locale), shellescape.Quote(c.BrowserLanguage))
+	if theme := os.Getenv(GuestThemeEnv); theme == "light" || theme == "dark" {
+		env += fmt.Sprintf("export %s=%s\n", GuestThemeEnv, shellescape.Quote(theme))
+	}
+	return env + guestEnv
 }
 
 func (c Config) StartScript() string {
@@ -322,19 +395,65 @@ func (c Config) StartScript() string {
 
 func (c Config) SetupScript() string { return c.GuestProfile.Linux(GuestSetup) }
 
+// clearAccountComment empties the work account's comment field. Environments
+// created by earlier versions copied the host account's full name into it.
+// Only the comment changes; the account, its groups and home stay as they are.
+const clearAccountComment = `account_name=$(id -un)
+if [ -n "$(getent passwd "$account_name" | cut -d: -f5)" ]; then sudo usermod -c '' "$account_name" || echo 'The account comment could not be cleared.' >&2; fi
+unset account_name
+`
+
 func componentStartScript() string {
-	return APTBootstrapScript + "\n" + claudeAccountScript() + browserServices() + "\nsudo tee /etc/claude-cage/editor-theme.json >/dev/null <<'CAGE_EDITOR_THEME'\n" + editorTheme + "\nCAGE_EDITOR_THEME\nif systemctl is-active --quiet cage-editor.service; then sudo systemctl stop cage-editor.service; fi\n" + guestStart
+	return clearAccountComment + APTBootstrapScript + "\n" + claudeAccountScript() + browserServices() + "\nsudo tee /etc/claude-cage/editor-theme.json >/dev/null <<'CAGE_EDITOR_THEME'\n" + editorTheme + "\nCAGE_EDITOR_THEME\nif systemctl is-active --quiet cage-editor.service; then sudo systemctl stop cage-editor.service; fi\n" + guestStart
 }
 
 func markGuestStart(body string) string {
 	manifest, _ := json.Marshal(RequiredGuestManifest())
-	return "set -euo pipefail\nsudo rm -f /etc/claude-cage/components.json\n(\n" + body + "\n)\nsudo python3 - <<'CAGE_COMPONENT_MANIFEST'\nfrom pathlib import Path\nimport os,tempfile\np=Path('/etc/claude-cage/components.json')\nfd,name=tempfile.mkstemp(prefix='.components-',dir=p.parent)\nwith os.fdopen(fd,'w') as f:\n f.write(" + fmt.Sprintf("%q", string(manifest)) + ")\n f.flush();os.fsync(f.fileno())\nos.chmod(name,0o644)\nos.replace(name,p)\nCAGE_COMPONENT_MANIFEST\n"
+	// Keep the last successful manifest, but invalidate it durably before any
+	// component changes. An interrupted start must be replayed, never accepted.
+	return `set -euo pipefail
+sudo python3 - <<'CAGE_COMPONENT_UPDATE'
+from pathlib import Path
+import os
+p=Path('/etc/claude-cage/components.updating')
+p.parent.mkdir(parents=True,exist_ok=True)
+with p.open('w') as f:
+ f.flush();os.fsync(f.fileno())
+fd=os.open(p.parent,os.O_RDONLY)
+try: os.fsync(fd)
+finally: os.close(fd)
+CAGE_COMPONENT_UPDATE
+(
+` + body + `
+)
+sudo python3 - <<'CAGE_COMPONENT_MANIFEST'
+from pathlib import Path
+import os,tempfile
+p=Path('/etc/claude-cage/components.json')
+directory=os.open(p.parent,os.O_RDONLY)
+name=None
+try:
+ fd,name=tempfile.mkstemp(prefix='.components-',dir=p.parent)
+ with os.fdopen(fd,'w') as f:
+  f.write(` + fmt.Sprintf("%q", string(manifest)) + `)
+  os.chmod(name,0o644)
+  f.flush();os.fsync(f.fileno())
+ os.replace(name,p)
+ os.fsync(directory)
+ p.with_suffix('.updating').unlink()
+ os.fsync(directory)
+finally:
+ if name is not None and os.path.exists(name): os.unlink(name)
+ os.close(directory)
+CAGE_COMPONENT_MANIFEST
+`
 }
 
 type GuestManifest struct {
 	Protocol   int    `json:"protocol"`
 	Revision   string `json:"revision"`
 	AppVersion string `json:"app_version"`
+	Updating   bool   `json:"updating,omitempty"`
 }
 
 var guestRevision = sync.OnceValue(func() string {
@@ -348,7 +467,7 @@ func RequiredGuestManifest() GuestManifest {
 
 func (m GuestManifest) Current() bool {
 	required := RequiredGuestManifest()
-	return m.Protocol == required.Protocol && m.Revision == required.Revision
+	return !m.Updating && m.Protocol == required.Protocol && m.Revision == required.Revision
 }
 
 func guestDiagnostics() string {

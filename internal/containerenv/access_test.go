@@ -5,10 +5,14 @@ import (
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -100,5 +104,100 @@ func TestGuestSSHNegotiatesPinnedHostKeyAndRejectsReplacement(t *testing.T) {
 		connection.Close()
 		listener.Close()
 		<-serverDone
+	}
+}
+
+func TestAccountSetupWaitsForColdStartedSSHService(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the container script runs in a Linux container")
+	}
+	for _, test := range []struct {
+		name     string
+		inactive int
+		code     int
+	}{{"ready after two probes", 2, 0}, {"never ready", 1000, 75}} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			probes := filepath.Join(dir, "probes")
+			// The fake unit stays inactive for a fixed number of probes; sleep is a no-op.
+			systemctl := fmt.Sprintf("#!/bin/sh\n[ \"$*\" = 'is-active --quiet ssh' ] || exit 91\nprintf x >> %q\n[ \"$(wc -c < %q)\" -gt %d ]\n", probes, probes, test.inactive)
+			for name, body := range map[string]string{"systemctl": systemctl, "sleep": "#!/bin/sh\nexit 0\n"} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cmd := exec.Command("sh", "-c", "set -eu\n"+waitForSSHService+"printf configured\n")
+			cmd.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"))
+			out, err := cmd.Output()
+			code := 0
+			var exit *exec.ExitError
+			if errors.As(err, &exit) {
+				code = exit.ExitCode()
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			data, _ := os.ReadFile(probes)
+			if code != test.code || (code == 0) != (string(out) == "configured") {
+				t.Fatalf("exit %d output %q after %d probes", code, out, len(data))
+			}
+			if code == 0 && len(data) != test.inactive+1 {
+				t.Fatalf("account setup continued after %d probes", len(data))
+			}
+			if code != 0 && len(data) != 31 {
+				t.Fatalf("readiness wait made %d probes", len(data))
+			}
+		})
+	}
+}
+
+func TestInterruptedKeyAndTrustRecordsRecover(t *testing.T) {
+	r := newRuntime(t.TempDir(), fixtureConfig())
+	if err := os.MkdirAll(r.InstanceDir(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	key := filepath.Join(r.InstanceDir(), "id_ed25519")
+	// Earlier versions created the key file before writing it.
+	if err := os.WriteFile(key, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	public, err := r.ensureSSHKey()
+	if err != nil || len(public) == 0 {
+		t.Fatal("empty key file blocked access:", err)
+	}
+	again, err := r.ensureSSHKey()
+	if err != nil || string(again) != string(public) {
+		t.Fatal("key changed on the next start", err)
+	}
+	// Anything else stays in place and is reported, never replaced.
+	if err := os.WriteFile(key, []byte("-----BEGIN OPENSSH PRIVATE KEY-----\ncut"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ensureSSHKey(); err == nil {
+		t.Fatal("damaged key accepted")
+	}
+	if b, _ := os.ReadFile(key); !strings.HasSuffix(string(b), "cut") {
+		t.Fatal("damaged key was overwritten")
+	}
+	trust := filepath.Join(r.InstanceDir(), "known_hosts")
+	if err := os.WriteFile(trust, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeEmptyRecord(trust); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(trust); !os.IsNotExist(err) {
+		t.Fatal("empty trust record kept", err)
+	}
+	if err := os.WriteFile(trust, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeEmptyRecord(trust); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(trust); string(b) != "x" {
+		t.Fatal("non-empty trust record removed")
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(r.InstanceDir(), ".*.tmp-*")); len(leftovers) != 0 {
+		t.Fatal(leftovers)
 	}
 }

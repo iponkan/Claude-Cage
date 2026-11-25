@@ -10,20 +10,46 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sylvinus/agent-vm/internal/cage"
-	"github.com/sylvinus/agent-vm/internal/guestos"
+	"github.com/sylvinus/agent-vm/internal/exitpolicy"
 	"github.com/sylvinus/agent-vm/internal/managedproxy"
 )
 
+// settledTempDir is t.TempDir for directories that fixture processes or server
+// goroutines may still write into when the test returns (macOS runners saw
+// "directory not empty" from the plain cleanup). Removal retries briefly.
+func settledTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "cage-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			err := os.RemoveAll(dir)
+			if err == nil || time.Now().After(deadline) {
+				if err != nil {
+					t.Errorf("remove %s: %v", dir, err)
+				}
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	})
+	return dir
+}
+
 func testServer(t *testing.T) *Server {
 	t.Helper()
-	profile := t.TempDir()
+	profile := settledTempDir(t)
 	path := filepath.Join(profile, "config.json")
 	c := cage.DefaultConfig()
 	p, _ := managedproxy.Load(profile)
 	p.Auth = strings.Repeat("secret", 8)
-	if err := p.Import("test", "", []byte(`proxies: [{name: qa, type: socks5, server: 127.0.0.1, port: 1}]`), "source", 0, ""); err != nil {
+	if err := p.Import("test", "", []byte(`proxies: [{name: qa, type: socks5, server: 192.0.2.1, port: 1}]`), "source", 0, ""); err != nil {
 		t.Fatal(err)
 	}
 	p.Selected = p.Sources[0].Nodes[0].ID
@@ -40,8 +66,12 @@ func testServer(t *testing.T) *Server {
 	// replace this in-memory fixture with the real persisted account store.
 	account := &localAccount{path: filepath.Join(profile, "account.json"), record: &accountRecord{Version: 1, Username: "Test"}}
 	account.setKey(make([]byte, 32))
-	t.Cleanup(account.lock)
-	return &Server{account: account, profile: profile, configPath: path, origin: "http://localhost:17777", token: strings.Repeat("a", 64), session: strings.Repeat("b", 64), preferences: Preferences{Keyboard: "mac"}}
+	s := &Server{account: account, profile: profile, configPath: path, origin: "http://localhost:17777", token: strings.Repeat("a", 64), session: strings.Repeat("b", 64), preferences: Preferences{Keyboard: "mac"}}
+	t.Cleanup(func() {
+		s.controlSession.close()
+		account.lock()
+	})
+	return s
 }
 
 // Fixtures for network policy tests need a published state without executing
@@ -92,7 +122,8 @@ func TestHostManagementBoundary(t *testing.T) {
 	if w.Header().Get("Access-Control-Allow-Origin") != "" {
 		t.Fatal("CORS unexpectedly enabled")
 	}
-	if !strings.Contains(w.Header().Get("Content-Security-Policy"), "frame-src 'none'") {
+	// Frames only for plugins' own pages, which are served sandboxed.
+	if !strings.Contains(w.Header().Get("Content-Security-Policy"), "frame-src "+s.origin+"/plugin-views/;") {
 		t.Fatal("guest frames allowed")
 	}
 }
@@ -147,7 +178,7 @@ func TestSettingsPreserveSecretsAndRejectHostSharing(t *testing.T) {
 	workspace := t.TempDir()
 	link := filepath.Join(workspace, "private-link")
 	if e = os.Symlink(s.profile, link); e != nil {
-		t.Fatal(e)
+		t.Skip("symlink unavailable, the link to the profile was not checked: " + e.Error())
 	}
 	input.Workspace = link
 	if _, _, e = proposedSettings(input, old, s.profile); e == nil {
@@ -222,14 +253,6 @@ func TestDisplayPreferenceAppliesAtNextLaunch(t *testing.T) {
 	if json.Unmarshal(w.Body.Bytes(), &active) != nil || !active.Dynamic {
 		t.Fatal("viewer was not told that the display follows its screen")
 	}
-	// A Windows guest's browser takes each viewer's density with its size.
-	s.credentials.DynamicScale = false
-	s.windowsGuest = &guestos.WindowsProfile{}
-	w = windowsBrowserRequestForTest(s, http.MethodGet, "/api/vnc-credentials", nil)
-	s.windowsGuest = nil
-	if json.Unmarshal(w.Body.Bytes(), &active) != nil || !active.Dynamic {
-		t.Fatalf("a Windows guest viewer was not told that the browser follows its screen: %d %s", w.Code, w.Body)
-	}
 	// A client that omits the new preference must preserve the user's choice.
 	settings := request(s, "GET", "/api/settings", "", "", true)
 	var payload map[string]any
@@ -249,7 +272,7 @@ func TestDisplayPreferenceAppliesAtNextLaunch(t *testing.T) {
 func TestLocationProbeHasNoDirectFallback(t *testing.T) {
 	c := cage.DefaultConfig()
 	c.ProxyURL = "socks5://127.0.0.1:1"
-	if _, e := probeLocation(context.Background(), c); e == nil {
+	if _, e := probeLocation(context.Background(), c, exitpolicy.LookupOptions{}); e == nil {
 		t.Fatal("location probe bypassed unavailable proxy")
 	}
 }
@@ -262,7 +285,7 @@ func TestLocationLiveIntegration(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	loc, e := probeLocation(context.Background(), c)
+	loc, e := probeLocation(context.Background(), c, exitpolicy.LookupOptions{})
 	if e != nil {
 		t.Fatal(e)
 	}

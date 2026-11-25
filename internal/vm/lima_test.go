@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,14 +27,30 @@ import (
 	"github.com/lima-vm/lima/v2/pkg/registry"
 
 	"github.com/sylvinus/agent-vm/internal/cage"
+	"github.com/sylvinus/agent-vm/internal/durable"
+	"github.com/sylvinus/agent-vm/internal/host"
 	"github.com/sylvinus/agent-vm/internal/limaembed"
 	"github.com/sylvinus/agent-vm/internal/paths"
 )
 
 func newTestLima(t *testing.T) *Lima {
 	t.Helper()
-	home := t.TempDir()
+	// Testing's name-based TempDir can exceed Lima's socket budget.
+	base := ""
+	if runtime.GOOS == "darwin" {
+		base = "/tmp"
+	}
+	home, err := os.MkdirTemp(base, "lima-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := host.RemoveAllWritable(home); err != nil {
+			t.Error(err)
+		}
+	})
 	t.Setenv("LIMA_HOME", home)
+	t.Setenv("CAGE_LOGICAL_LIMA_HOME", "")
 	t.Setenv("LIMA_TEMPLATES_PATH", "")
 	l, err := NewLima(home, t.TempDir())
 	if err != nil {
@@ -45,6 +62,29 @@ func newTestLima(t *testing.T) *Lima {
 		t.Fatal(err)
 	}
 	return l
+}
+
+func TestLimaCreateRejectsSocketPathTooLong(t *testing.T) {
+	home := filepath.Join(t.TempDir(), strings.Repeat("private-path-", 9))
+	t.Setenv("LIMA_HOME", home)
+	t.Setenv("CAGE_LOGICAL_LIMA_HOME", "")
+	lima, err := NewLima(home, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Path validation must run before trying to load this nonexistent template.
+	err = lima.Create(context.Background(), "base-building", "missing.yaml", Settings{}, io.Discard)
+	if !errors.Is(err, ErrNameTooLong) || !errors.Is(err, cage.ErrLimaSocketPathTooLong) ||
+		strings.Contains(err.Error(), home) || !strings.Contains(err.Error(), "最多") {
+		t.Fatalf("Create should return a path-free length error: %v", err)
+	}
+	if _, err := os.Stat(home); !os.IsNotExist(err) {
+		t.Fatalf("Create touched Lima home: %v", err)
+	}
+	err = lima.Create(context.Background(), strings.Repeat("x", 77), "missing.yaml", Settings{}, io.Discard)
+	if !errors.Is(err, ErrNameTooLong) || errors.Is(err, cage.ErrLimaSocketPathTooLong) {
+		t.Fatalf("Create should distinguish Lima's instance-name limit: %v", err)
+	}
 }
 
 func TestCageDebianMirrors(t *testing.T) {
@@ -272,9 +312,10 @@ func TestLimaLifecycle(t *testing.T) {
 	}
 }
 
-// Start gives a VM, made before or not, the rule leaving the guest's
-// ephemeral ports unforwarded: on 127.0.0.1, 0.0.0.0, ::, TCP or UDP, as
-// Lima's forwarder reads it. Other ports are forwarded still.
+// Start gives a VM, made before or not, the rules leaving the guest's
+// ephemeral ports, the host tools port and the guest-only service ports
+// unforwarded: on 127.0.0.1, 0.0.0.0, ::, TCP or UDP, as Lima's forwarder
+// reads it. Other ports are forwarded still.
 func TestLimaEphemeralPorts(t *testing.T) {
 	ctx := context.Background()
 	l := newTestLima(t)
@@ -298,7 +339,7 @@ func TestLimaEphemeralPorts(t *testing.T) {
 	if err != nil || inst.Config == nil {
 		t.Fatalf("inspect: %v %v", err, inst.Errors)
 	}
-	if n := len(inst.Config.PortForwards); n != 2 || inst.Config.PortForwards[0].GuestPort != 40000 {
+	if n := len(inst.Config.PortForwards); n != 5 || inst.Config.PortForwards[0].GuestPort != 40000 {
 		t.Errorf("port forwards: %+v", inst.Config.PortForwards)
 	}
 	def := limatype.PortForward{}
@@ -313,6 +354,9 @@ func TestLimaEphemeralPorts(t *testing.T) {
 		{Protocol: "tcp", Ip: "0.0.0.0", Port: 45000},
 		{Protocol: "tcp", Ip: "::", Port: 60999},
 		{Protocol: "udp", Ip: "0.0.0.0", Port: 50000},
+		{Protocol: "tcp", Ip: "127.0.0.1", Port: 18962},
+		{Protocol: "tcp", Ip: "127.0.0.1", Port: 18080},
+		{Protocol: "tcp", Ip: "127.0.0.1", Port: 16080},
 	} {
 		got = nil
 		fw.OnEvent(cctx, nil, &api.Event{AddedLocalPorts: []*api.IPPort{p}})
@@ -326,12 +370,18 @@ func TestLimaEphemeralPorts(t *testing.T) {
 	if len(got) != 1 || got[0].Type == events.PortForwardEventNotForwarding {
 		t.Errorf("32767: %+v", got)
 	}
+	// The host's VNC reaches the guest's 15900 through Lima: forwarded.
+	got = nil
+	fw.OnEvent(cctx, nil, &api.Event{AddedLocalPorts: []*api.IPPort{{Protocol: "tcp", Ip: "127.0.0.1", Port: 15900}}})
+	if len(got) != 1 || got[0].Type == events.PortForwardEventNotForwarding {
+		t.Errorf("15900: %+v", got)
+	}
 
 	// Once there, not written again.
 	y := filepath.Join(inst.Dir, "lima.yaml")
 	before, _ := os.ReadFile(y)
 	l.Start(ctx, "p-12345678", io.Discard)
-	if after, _ := os.ReadFile(y); string(after) != string(before) || strings.Count(string(after), "ignore: true") != 1 {
+	if after, _ := os.ReadFile(y); string(after) != string(before) || strings.Count(string(after), "ignore: true") != 4 {
 		t.Errorf("rewritten:\n%s", after)
 	}
 }
@@ -497,6 +547,47 @@ func TestUserLimaHome(t *testing.T) {
 	}
 }
 
+// A child agent-vm process sees the user's LIMA_HOME, not the one NewLima set.
+func TestChildEnvRestoresUserLimaHome(t *testing.T) {
+	oldSet, oldUser := limaHomeSet, userLimaHome
+	t.Cleanup(func() { limaHomeSet, userLimaHome = oldSet, oldUser })
+	homes := func(env []string) []string {
+		var found []string
+		for _, entry := range env {
+			if key, value, _ := strings.Cut(entry, "="); strings.EqualFold(key, "LIMA_HOME") {
+				found = append(found, value)
+			}
+		}
+		return found
+	}
+	ours := t.TempDir()
+
+	limaHomeSet, userLimaHome = "", ""
+	user := t.TempDir()
+	t.Setenv("LIMA_HOME", user)
+	if got := homes(ChildEnv()); !slices.Equal(got, []string{user}) {
+		t.Errorf("before NewLima: %q", got)
+	}
+	if _, err := NewLima(ours, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if got := homes(ChildEnv()); !slices.Equal(got, []string{user}) {
+		t.Errorf("with the user's LIMA_HOME: %q, want %q", got, user)
+	}
+
+	limaHomeSet, userLimaHome = "", ""
+	os.Unsetenv("LIMA_HOME")
+	if _, err := NewLima(ours, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if os.Getenv("LIMA_HOME") != ours {
+		t.Fatal("NewLima did not set LIMA_HOME")
+	}
+	if got := homes(ChildEnv()); len(got) != 0 {
+		t.Errorf("without the user's LIMA_HOME: %q", got)
+	}
+}
+
 func TestLimaDrivers(t *testing.T) {
 	l := newTestLima(t)
 	ctx := t.Context()
@@ -567,5 +658,28 @@ func TestLimaEditConcurrent(t *testing.T) {
 		if strings.HasSuffix(e.Name(), ".tmp") {
 			t.Errorf("left behind: %s", e.Name())
 		}
+	}
+}
+
+func TestLimaEditFlushesTheInstanceDirectory(t *testing.T) {
+	ctx := context.Background()
+	l := newTestLima(t)
+	none := []Mount{}
+	if err := l.Create(ctx, "p-87654321", "template:debian-13", Settings{Mounts: &none}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	var synced []string
+	original := durable.SyncDir
+	durable.SyncDir = func(d string) error { synced = append(synced, d); return original(d) }
+	t.Cleanup(func() { durable.SyncDir = original })
+	if err := l.Edit(ctx, "p-87654321", Settings{CPUs: 2}); err != nil {
+		t.Fatal(err)
+	}
+	p, err := l.Get(ctx, "p-87654321")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(synced) != 1 || synced[0] != p.Dir {
+		t.Fatalf("synced %q, instance %q", synced, p.Dir)
 	}
 }

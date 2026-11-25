@@ -45,7 +45,7 @@ func AgentSocket(ctx context.Context, configPath string, target AgentTarget, pat
 	ws, response, err := dialer.DialContext(ctx, "ws"+strings.TrimPrefix(c.origin, "http")+path, headers)
 	if err != nil {
 		if response != nil {
-			return agentHTTPError(response.StatusCode)
+			return agentResponseError(response.StatusCode, response.Header.Get("X-Cage-Recovery"))
 		}
 		return &AgentError{Code: "connection_failed", Message: "WebSocket connection failed", NextAction: "status"}
 	}
@@ -143,6 +143,9 @@ func AgentSocket(ctx context.Context, configPath string, target AgentTarget, pat
 			continue
 		}
 		if err := emit(value); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			return err
 		}
 	}

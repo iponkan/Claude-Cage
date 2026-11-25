@@ -37,7 +37,9 @@ func (p *Profile) Linux(script string) string {
 		script = strings.ReplaceAll(script, "pwd.getpwnam("+v+")", "pwd.getpwnam("+roles+".get("+v+", "+v+"))")
 	}
 	script = strings.ReplaceAll(script, "cage_output", p.AudioName)
+	script = strings.ReplaceAll(script, "cage_input", p.AudioInputName())
 	script = strings.ReplaceAll(script, "sink_properties=device.description=Cage", `sink_properties="device.description='`+p.AudioDescription+`'"`)
+	script = strings.ReplaceAll(script, "source_properties=device.description=Cage", `source_properties="device.description='`+p.AudioDescription+`'"`)
 	script = strings.ReplaceAll(script, "2880x1800", fmt.Sprintf("%dx%d", p.DisplayWidth, p.DisplayHeight))
 	script = strings.ReplaceAll(script, "--window-size=1440,900", fmt.Sprintf("--window-size=%d,%d", p.BrowserWidth, p.BrowserHeight))
 	if p.GPUBackend == "virgl" {
@@ -53,10 +55,7 @@ func (p *Profile) Linux(script string) string {
 	script = strings.ReplaceAll(script, `"name": "Cage browser panes"`, `"name": `+string(manifestName))
 	// The unpacked extension ID is derived from its path. Give each new
 	// environment a saved path as well as a configurable display name.
-	script = strings.NewReplacer(
-		"/usr/local/lib/cage-split", "/usr/local/lib/browser-panes-"+p.ExtensionSuffix,
-		"/var/snap/chromium/common/workbench-extension", "/var/snap/chromium/common/browser-panes-"+p.ExtensionSuffix,
-	).Replace(script)
+	script = strings.ReplaceAll(script, "/usr/local/lib/cage-split", "/usr/local/lib/browser-panes-"+p.ExtensionSuffix)
 	flags := p.GraphicsFlags()
 	if p.WebGL == "disabled" {
 		flags = append(flags, "--disable-3d-apis", "--disable-webgl")
@@ -120,4 +119,21 @@ func (p *Profile) BrowserUser() string {
 		return "cage-browser"
 	}
 	return p.BrowserUsername
+}
+
+// AudioInputName derives a matching PulseAudio input source name from the
+// profile's audio sink name without introducing guest or product identifiers.
+func (p *Profile) AudioInputName() string {
+	if p == nil || p.AudioName == "" {
+		return "cage_input"
+	}
+	if strings.HasPrefix(p.AudioName, "alsa_output.") {
+		return "alsa_input." + strings.TrimPrefix(p.AudioName, "alsa_output.")
+	}
+	const suffix = "_input"
+	base := p.AudioName
+	if len(base)+len(suffix) > 120 {
+		base = base[:120-len(suffix)]
+	}
+	return base + suffix
 }

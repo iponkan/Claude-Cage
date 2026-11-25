@@ -5,8 +5,10 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { phoneError, startPhoneProxy, webAddress } from "./browser-phone-network.mjs";
+import { PhoneHistoryStore } from "./browser-history.mjs";
 
 const idleTimeout = 2 * 60 * 1000;
+const maxPhoneBrowsers = 8;
 const validID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const keys = new Map([
   ["Enter", 13], ["Tab", 9], ["Escape", 27], ["Backspace", 8], ["Delete", 46],
@@ -107,42 +109,85 @@ async function saveLanguage(profile, language) {
 
 export class PhoneBrowser {
   constructor({ binary = "/usr/bin/chromium", directory = "/home/cage-browser/phone-profiles",
-                language = process.env.CAGE_LANGUAGE || "en-US", connect, pipeFactory } = {}) {
+                language = process.env.CAGE_LANGUAGE || "en-US", connect, pipeFactory, maxSessions = maxPhoneBrowsers } = {}) {
     this.binary = binary;
     this.directory = directory;
     this.language = language;
     this.connect = connect;
     this.pipeFactory = pipeFactory ?? ((binary, args) => new BrowserPipe(binary, args));
-    this.queue = Promise.resolve();
-    this.pending = 0;
+    this.maxSessions = maxSessions;
+    this.historyStore = new PhoneHistoryStore({ directory: this.directory, validateURL: webAddress });
+    this.sessions = new Map(); // profile -> session
+    this.sessionById = new Map(); // id -> profile
+    this.opening = new Set(); // profiles currently launching
+    this.lanes = new Map(); // profile -> { queue, pending }
   }
-  run(operation, input, signal) {
-    // Serialize screenshot/context checks with all layout and input changes.
-    if (this.pending >= 12) return Promise.reject(new Error("手机浏览器正在处理上一项操作"));
-    this.pending++;
-    const task = this.queue.then(() => this.perform(operation, input, signal));
-    this.queue = task.catch(() => {}).finally(() => { this.pending--; });
+  get session() {
+    let last = null;
+    for (const s of this.sessions.values()) last = s;
+    return last;
+  }
+  async history(input) {
+    if (!input || typeof input.profile !== "string" || !/^[a-f0-9]{64}$/.test(input.profile)) {
+      throw new Error("手机浏览器资料无效");
+    }
+    return this.historyStore.request(input.profile, input);
+  }
+  enqueue(profile, fn) {
+    let lane = this.lanes.get(profile);
+    if (!lane) {
+      lane = { queue: Promise.resolve(), pending: 0 };
+      this.lanes.set(profile, lane);
+    }
+    if (lane.pending >= 12) return Promise.reject(new Error("手机浏览器正在处理上一项操作"));
+    lane.pending++;
+    const task = lane.queue.then(fn);
+    lane.queue = task.catch(() => {}).finally(() => {
+      lane.pending--;
+      if (lane.pending === 0 && !this.sessions.has(profile)) this.lanes.delete(profile);
+    });
     return task;
   }
-  async perform(operation, input, signal) {
-    if (!input || !validID.test(input.id)) throw new Error("手机浏览器会话无效");
+  run(operation, input, signal) {
+    if (!input || !validID.test(input.id)) return Promise.reject(new Error("手机浏览器会话无效"));
+    if (operation === "open") {
+      if (typeof input.profile !== "string" || !/^[a-f0-9]{64}$/.test(input.profile)) {
+        return Promise.reject(new Error("手机浏览器资料无效"));
+      }
+      const existingOwner = this.sessionById.get(input.id);
+      if (existingOwner && existingOwner !== input.profile) {
+        return Promise.reject(phoneError(409, "手机浏览器会话冲突"));
+      }
+      return this.enqueue(input.profile, () => this.perform(operation, input, input.profile, signal));
+    }
+    const profile = this.sessionById.get(input.id);
+    if (!profile) return Promise.reject(phoneError(410, "手机浏览器会话已结束，请重新打开"));
+    return this.enqueue(profile, () => this.perform(operation, input, profile, signal));
+  }
+  async perform(operation, input, profile, signal) {
     if (operation === "open") {
       const size = dimensions(input);
-      if (typeof input.profile !== "string" || !/^[a-f0-9]{64}$/.test(input.profile)) throw new Error("手机浏览器资料无效");
       const url = input.url ? webAddress(input.url) : "";
-      if (!this.session) {
-        try { await this.open(input.id, input.profile, size, url, signal); }
+      const existingOwner = this.sessionById.get(input.id);
+      if (existingOwner && existingOwner !== profile) throw phoneError(409, "手机浏览器会话冲突");
+      if (!this.sessions.has(profile)) {
+        if (this.sessions.size + this.opening.size >= this.maxSessions) {
+          throw phoneError(409, "同时打开的远程浏览器数量已达上限");
+        }
+        this.opening.add(profile);
+        try { await this.open(input.id, profile, size, url, signal); }
         catch (error) {
           if (error.status === 403 || error.status === 409) throw error;
           throw phoneError(503, "客机浏览器暂时无法启动，请稍后重新打开");
+        } finally {
+          this.opening.delete(profile);
         }
       }
-      else if (input.profile !== this.session.profile) throw phoneError(409, "另一部手机正在使用浏览器");
     }
-    const s = this.session;
+    const s = this.sessions.get(profile);
     if (!s || s.id !== input.id) throw phoneError(410, "手机浏览器会话已结束，请重新打开");
-    clearTimeout(this.timer);
-    this.timer = setTimeout(() => { void this.run("close", { id: s.id }).catch(() => {}); }, idleTimeout).unref();
+    clearTimeout(s.timer);
+    s.timer = setTimeout(() => { void this.run("close", { id: s.id }).catch(() => {}); }, idleTimeout).unref();
     if (operation === "open") return { id: s.id };
     if (operation === "frame") return this.frame(s, input.after);
     if (operation === "action") {
@@ -171,14 +216,19 @@ export class PhoneBrowser {
       "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
       "--lang=" + this.language, "--accept-lang=" + this.language, "--user-data-dir=" + data, "about:blank",
     ]); } catch (error) { proxy.close(); throw error; }
-    const s = { id, profile, ...size, pipe, proxy };
-    this.session = s;
+    const s = { id, profile, ...size, pipe, proxy, timer: null };
+    this.sessions.set(profile, s);
+    this.sessionById.set(id, profile);
     let stopping;
     const stop = () => { stopping ??= this.dispose(s); };
     signal?.addEventListener("abort", stop, { once: true });
     pipe.closed.then(() => {
       proxy.close();
-      if (this.session === s) { this.session = null; clearTimeout(this.timer); }
+      if (this.sessions.get(profile) === s) {
+        this.sessions.delete(profile);
+        clearTimeout(s.timer);
+      }
+      if (this.sessionById.get(id) === profile) this.sessionById.delete(id);
     });
     try {
       signal?.throwIfAborted();
@@ -213,12 +263,16 @@ export class PhoneBrowser {
     } catch (error) { await (stopping ?? this.dispose(s)); throw error; }
     finally { signal?.removeEventListener("abort", stop); }
   }
-  async dispose(s = this.session) {
-    if (!s) return;
-    clearTimeout(this.timer);
+  async dispose(s) {
+    if (!s) {
+      await Promise.all([...this.sessions.values()].map(active => this.dispose(active)));
+      return;
+    }
+    clearTimeout(s.timer);
+    if (this.sessions.get(s.profile) === s) this.sessions.delete(s.profile);
+    if (this.sessionById.get(s.id) === s.profile) this.sessionById.delete(s.id);
     s.proxy.close();
     await s.pipe.close();
-    if (this.session === s) this.session = null;
   }
   async resize(s, size) {
     // Keep the page in phone CSS pixels, with enough image pixels for legible
@@ -258,7 +312,13 @@ export class PhoneBrowser {
     const after = await this.document(s);
     if (before.token !== after.token) throw phoneError(409, "页面正在切换，请重新读取画面");
     if (!picture.data || picture.data.length > 2500000) throw new Error("远程画面过大，请减小视口");
-    const metadata = { id: s.id, url: after.url, title: info.targetInfo.title.slice(0, 512), width: s.width,
+    const title = info.targetInfo.title.slice(0, 512);
+    if (!after.failed && after.url && (s.lastRecordedURL !== after.url || (title && s.lastRecordedTitle !== title))) {
+      s.lastRecordedURL = after.url;
+      s.lastRecordedTitle = title;
+      void this.historyStore.record(s.profile, after.url, title).catch(() => {});
+    }
+    const metadata = { id: s.id, url: after.url, title, width: s.width,
       height: s.height, document: after.token, ...focus };
     const tag = createHash("sha256").update(JSON.stringify(metadata)).update(picture.data, "ascii").digest("hex").slice(0, 32);
     if (previousTag === tag) return { id: s.id, frame_tag: tag, unchanged: true };

@@ -61,43 +61,6 @@ func resolveProjectFilePath(guest string, projects []string) (string, error) {
 	return "", errors.New("只能打开 Cage 项目目录中的文件和文件夹")
 }
 
-func (s *Server) resolveDesktopProjectFile(guest string, projects []string) (string, error) {
-	if s.macosGuest == nil && s.windowsGuest == nil {
-		return resolveProjectFilePath(guest, projects)
-	}
-	if s.windowsGuest != nil {
-		guest = strings.ReplaceAll(guest, "\\", "/")
-		if !windowsCLIAbsolutePath(guest) || strings.Contains(guest[2:], ":") {
-			return "", errors.New("文件位置无效")
-		}
-	}
-	if pathpkg.Clean(guest) != guest || strings.ContainsAny(guest, "\x00\\") {
-		return "", errors.New("文件位置无效")
-	}
-	for _, project := range projects {
-		if isClientMountPath(project) {
-			continue
-		}
-		var root string
-		if s.macosGuest != nil {
-			root = macOSProjectPath(s.macosGuest.User, project)
-		} else {
-			binding, err := s.windowsProjectForHost(project)
-			if err != nil {
-				continue
-			}
-			root = strings.ReplaceAll(binding.Path, "\\", "/")
-		}
-		root = strings.TrimRight(root, "/")
-		if !cliWorkspaceWithin(guest, root, s.windowsGuest != nil) {
-			continue
-		}
-		mapped := strings.TrimRight(guestPath(project), "/") + guest[len(root):]
-		return resolveProjectFilePath(mapped, []string{project})
-	}
-	return "", errors.New("只能打开已授权 Cage 项目中的文件和文件夹")
-}
-
 func (s *Server) desktopFileOpenAction(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		ID    string `json:"id"`
@@ -117,8 +80,9 @@ func (s *Server) desktopFileOpenAction(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Minute)
 	defer cancel()
+	desktopID := s.desktopFileOwner(input.ID)
 	body, _ := json.Marshal(input)
-	result, err := s.guestFiles(ctx, "desktop", "POST", "/open-"+input.Stage, bytes.NewReader(body), "")
+	result, err := s.guestFilesForDesktop(ctx, desktopID, "desktop", "POST", "/open-"+input.Stage, bytes.NewReader(body), "")
 	if err != nil {
 		requestError(w, err)
 		return
@@ -130,33 +94,22 @@ func (s *Server) desktopFileOpenAction(w http.ResponseWriter, r *http.Request) {
 	guest, _ := result["path"].(string)
 	action, _ := result["action"].(string)
 	var target string
-	download, _ := result["download_id"].(string)
 	if message, _ := result["error"].(string); message != "" {
 		err = errors.New(message)
 	} else if action != "open" && action != "reveal" {
 		err = errors.New("文件打开操作无效")
-	} else if download != "" && (s.macosGuest != nil || s.windowsGuest != nil) {
-		var saved browserDownloadInfo
-		saved, err = s.downloadInfo(ctx, download)
-		if err == nil && saved.State != "saved" {
-			err = errors.New("文件尚未完整保存到主机，请稍后重新打开")
-		}
-		target = saved.Path
-		if err == nil && result["directory"] == true {
-			target = filepath.Dir(target)
-		}
 	} else {
 		var projects []string
 		projects, err = s.projectPaths()
 		if err == nil {
-			target, err = s.resolveDesktopProjectFile(guest, projects)
+			target, err = resolveProjectFilePath(guest, projects)
 		}
 	}
 	if err != nil {
 		body, _ = json.Marshal(map[string]string{"id": input.ID, "error": err.Error()})
 		cleanup, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancelCleanup()
-		_, _ = s.guestFiles(cleanup, "desktop", "POST", "/open-complete", bytes.NewReader(body), "")
+		_, _ = s.guestFilesForDesktop(cleanup, desktopID, "desktop", "POST", "/open-complete", bytes.NewReader(body), "")
 		requestError(w, err)
 		return
 	}

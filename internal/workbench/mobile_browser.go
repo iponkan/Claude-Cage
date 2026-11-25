@@ -3,10 +3,7 @@ package workbench
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -33,26 +30,36 @@ func (surface phoneSurface) label() string {
 }
 
 type phoneSurfaceState struct {
-	op            sync.Mutex
-	session       *phoneSurfaceSession        // guarded by op
-	nativeBrowser *windowsBrowserClient       // Native guest phone browser, guarded by op
-	nativeDesktop *windowsPhoneDesktopSession // Windows shared app window, guarded by op
+	op      sync.Mutex
+	session *phoneSurfaceSession // guarded by op
 }
 
 func (p *mobilePairing) surface(kind phoneSurface) *phoneSurfaceState {
 	if kind == phoneDesktop {
 		return &p.desktop
 	}
-	return &p.browser
+	if len(p.slots) > 0 {
+		return &p.slots[0].browser
+	}
+	return &phoneSurfaceState{}
+}
+
+func (p *mobilePairing) surfaceForSlot(kind phoneSurface, slot *phoneSlot) *phoneSurfaceState {
+	if kind == phoneDesktop {
+		return &p.desktop
+	}
+	return &slot.browser
 }
 
 func (p *mobilePairing) pairedRequestLocked(r *http.Request) bool {
-	return p.roomCtx != nil && p.roomCtx.Err() == nil && p.roomProof != "" && equalSecret(p.roomProof, r.Header.Get(mobilelink.PhoneRoomHeader))
+	return p.matchPhoneLocked(r) != nil
 }
 
 func (s *Server) mobileSurfaceRoutes(mux routeRegistrar) {
 	mux.HandleFunc("GET /api/mobile/browser/favorites", s.serveFavorites)
 	mux.HandleFunc("POST /api/mobile/browser/favorites", s.serveFavorites)
+	mux.HandleFunc("GET /api/mobile/browser/history", s.servePhoneHistory)
+	mux.HandleFunc("POST /api/mobile/browser/history", s.servePhoneHistory)
 	for _, surface := range []phoneSurface{phoneBrowser, phoneDesktop} {
 		route := "/api/mobile/" + string(surface)
 		handle := func(w http.ResponseWriter, r *http.Request) { s.phoneSurfaceRequest(surface, w, r) }
@@ -65,11 +72,10 @@ func (s *Server) mobileSurfaceRoutes(mux routeRegistrar) {
 
 // Keep the private guest profile stable across reconnects to the same enrollment.
 func (p *mobilePairing) peerLocked() string {
-	if p.record == nil {
+	if len(p.slots) == 0 {
 		return ""
 	}
-	digest := sha256.Sum256(p.record.Seed)
-	return hex.EncodeToString(digest[:])
+	return p.slots[0].peer()
 }
 
 type phoneSurfaceSession struct {
@@ -179,8 +185,11 @@ func (s *Server) phoneSurfaceNetwork(ctx context.Context) bool {
 // Caller holds this surface’s operation lock. Closing only this ID lets later opens safely use a
 // fresh session after a lock, disconnected phone, failed open or revocation.
 func (s *Server) retirePhoneSurface(surface phoneSurface, b *phoneSurfaceSession) {
-	state := s.phones.surface(surface)
-	if b == nil || state.session != b {
+	s.retirePhoneSurfaceState(s.phones.surface(surface), surface, b)
+}
+
+func (s *Server) retirePhoneSurfaceState(state *phoneSurfaceState, surface phoneSurface, b *phoneSurfaceSession) {
+	if state == nil || b == nil || state.session != b {
 		return
 	}
 	state.session = nil
@@ -194,41 +203,9 @@ func (s *Server) retirePhoneSurface(surface phoneSurface, b *phoneSurfaceSession
 		b.releaseDisplay()
 		b.releaseDisplay = nil
 	}
-	if surface == phoneBrowser && state.nativeBrowser != nil {
-		state.nativeBrowser.close()
-		state.nativeBrowser = nil
-	}
 }
 
 func (s *Server) phoneSurfaceGuest(ctx context.Context, surface phoneSurface, token, op string, input phoneSurfaceInput) ([]byte, int, error) {
-	if surface == phoneDesktop && s.windowsGuest != nil {
-		return s.windowsPhoneDesktop(ctx, token, op, input)
-	}
-	if surface == phoneDesktop && s.macosGuest != nil {
-		return s.macOSPhoneDesktop(ctx, token, op, input)
-	}
-	if surface == phoneBrowser && (s.windowsGuest != nil || s.macosGuest != nil) {
-		client := s.phones.browser.nativeBrowser
-		if client == nil {
-			return nil, 410, nil
-		}
-		out, err := client.request(ctx, "POST", "/phone-browser/"+op, input)
-		if err != nil {
-			var rejected windowsPhoneBrowserError
-			if errors.As(err, &rejected) {
-				return nil, rejected.status, nil
-			}
-			return nil, 502, err
-		}
-		limit := 4096
-		if op == "frame" || input.ReturnFrame {
-			limit = 3 << 20
-		}
-		if len(out) > limit || !json.Valid(out) {
-			return nil, 502, nil
-		}
-		return out, 200, nil
-	}
 	data, err := json.Marshal(input)
 	if err != nil {
 		return nil, 400, err
@@ -258,11 +235,17 @@ func (s *Server) phoneSurfaceGuest(ctx context.Context, surface phoneSurface, to
 func (s *Server) phoneSurfaceRequest(surface phoneSurface, w http.ResponseWriter, r *http.Request) {
 	p := &s.phones
 	p.mu.Lock()
-	state := p.surface(surface)
-	room, profile := p.roomCtx, p.peerLocked()
-	allowed := p.pairedRequestLocked(r)
+	slot := p.matchPhoneLocked(r)
+	var state *phoneSurfaceState
+	var room context.Context
+	var profile string
+	if slot != nil {
+		state = p.surfaceForSlot(surface, slot)
+		room = slot.roomCtx
+		profile = slot.peer()
+	}
 	p.mu.Unlock()
-	if !allowed {
+	if slot == nil {
 		http.Error(w, "请通过电脑 Cage 的二维码或配对码连接这台主机，再打开"+surface.label()+"。", 403)
 		return
 	}
@@ -277,7 +260,7 @@ func (s *Server) phoneSurfaceRequest(surface phoneSurface, w http.ResponseWriter
 		return
 	}
 	if input.After != "" || input.Profile != "" || (op != "open" && input.ID != "") ||
-		(input.ReturnFrame && (surface != phoneBrowser || op != "action")) {
+		(input.ReturnFrame && op != "action") {
 		http.Error(w, "图形会话请求无效", 400)
 		return
 	}
@@ -319,7 +302,7 @@ func (s *Server) phoneSurfaceRequest(surface phoneSurface, w http.ResponseWriter
 	}
 	b := state.session
 	if b != nil && (b.ctx.Err() != nil || op == "open" && b.id != input.ID) {
-		s.retirePhoneSurface(surface, b)
+		s.retirePhoneSurfaceState(state, surface, b)
 		b = nil
 	}
 	if op != "open" && (b == nil || b.id != input.ID) {
@@ -327,12 +310,12 @@ func (s *Server) phoneSurfaceRequest(surface phoneSurface, w http.ResponseWriter
 		return
 	}
 	if op == "close" {
-		s.retirePhoneSurface(surface, b)
+		s.retirePhoneSurfaceState(state, surface, b)
 		jsonReply(w, map[string]string{"id": input.ID})
 		return
 	}
 	if !s.phoneSurfaceNetwork(r.Context()) {
-		s.retirePhoneSurface(surface, b)
+		s.retirePhoneSurfaceState(state, surface, b)
 		http.Error(w, "请在电脑启动 Cage，并确保网络检查已放行。", 409)
 		return
 	}
@@ -345,16 +328,7 @@ func (s *Server) phoneSurfaceRequest(surface phoneSurface, w http.ResponseWriter
 		s.mu.Lock()
 		token := s.credentials.Token
 		s.mu.Unlock()
-		if surface == phoneDesktop && (s.macosGuest != nil || s.windowsGuest != nil) {
-			token = randomToken()
-		}
 		b = &phoneSurfaceSession{id: input.ID, token: token, ctx: sessionCtx, cancel: cancel, stopEpoch: context.AfterFunc(epoch, cancel)}
-		if surface == phoneBrowser && s.windowsGuest != nil {
-			state.nativeBrowser = newWindowsBrowserClient(s.lifetimeContext(), s.profile)
-		}
-		if surface == phoneBrowser && s.macosGuest != nil {
-			state.nativeBrowser = s.macOSPhoneBrowserClient(s.lifetimeContext())
-		}
 		if surface == phoneDesktop {
 			b.readyUntil = time.Now().Add(90 * time.Second)
 		}
@@ -362,13 +336,13 @@ func (s *Server) phoneSurfaceRequest(surface phoneSurface, w http.ResponseWriter
 		if surface == phoneDesktop {
 			release, err := s.acquireDesktopView()
 			if err != nil {
-				s.retirePhoneSurface(surface, b)
+				s.retirePhoneSurfaceState(state, surface, b)
 				http.Error(w, "无法恢复 Claude Desktop 画面，请重新打开", http.StatusBadGateway)
 				return
 			}
 			b.releaseDisplay = release
 		}
-		context.AfterFunc(sessionCtx, func() { state.op.Lock(); defer state.op.Unlock(); s.retirePhoneSurface(surface, b) })
+		context.AfterFunc(sessionCtx, func() { state.op.Lock(); defer state.op.Unlock(); s.retirePhoneSurfaceState(state, surface, b) })
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	stop := context.AfterFunc(b.ctx, cancel)
@@ -376,7 +350,7 @@ func (s *Server) phoneSurfaceRequest(surface phoneSurface, w http.ResponseWriter
 	if b.startJob != "" || b.openInput.ID != "" {
 		job := s.jobs.snapshot()
 		if b.startJob != "" && job.ID == b.startJob && !job.Running && job.Error != "" {
-			s.retirePhoneSurface(surface, b)
+			s.retirePhoneSurfaceState(state, surface, b)
 			http.Error(w, "电脑上的 Claude Desktop 未能启动，请在电脑上查看操作详情", 502)
 			return
 		}
@@ -390,7 +364,7 @@ func (s *Server) phoneSurfaceRequest(surface phoneSurface, w http.ResponseWriter
 				http.Error(w, "正在打开 Claude Desktop", http.StatusTooEarly)
 				return
 			}
-			s.retirePhoneSurface(surface, b)
+			s.retirePhoneSurfaceState(state, surface, b)
 			http.Error(w, "无法连接电脑上的 Claude Desktop，请重新打开", 502)
 			return
 		}
@@ -405,24 +379,31 @@ func (s *Server) phoneSurfaceRequest(surface phoneSurface, w http.ResponseWriter
 		out, status, err = s.phoneSurfaceGuest(ctx, surface, b.token, op, input)
 	}
 	if b.ctx.Err() != nil || epoch.Err() != nil || room.Err() != nil {
-		s.retirePhoneSurface(surface, b)
+		s.retirePhoneSurfaceState(state, surface, b)
 		http.Error(w, surface.label()+"授权已结束", 410)
 		return
 	}
 	if r.Context().Err() != nil {
 		if op == "open" {
-			s.retirePhoneSurface(surface, b)
+			s.retirePhoneSurfaceState(state, surface, b)
 		}
 		return
 	}
 	if surface == phoneDesktop && op == "open" && err == nil && status == http.StatusPreconditionFailed {
+		// The phone view attaches to the default Desktop only. Without one a
+		// start job could never succeed, so say so instead of queueing it.
+		if !s.hasDefaultDesktop() {
+			s.retirePhoneSurfaceState(state, surface, b)
+			http.Error(w, "电脑上的默认 Claude Desktop 已删除或已并入其他实例，手机暂时只能打开默认 Desktop", http.StatusConflict)
+			return
+		}
 		job := s.jobs.snapshot()
 		var err error
 		if !job.Running || job.Kind != "claude-desktop-start" {
 			job, err = s.submitJob("claude-desktop-start", s.startClaudeDesktop)
 		}
 		if err != nil {
-			s.retirePhoneSurface(surface, b)
+			s.retirePhoneSurfaceState(state, surface, b)
 			http.Error(w, err.Error(), http.StatusConflict)
 			return
 		}
@@ -442,20 +423,20 @@ func (s *Server) phoneSurfaceRequest(surface phoneSurface, w http.ResponseWriter
 		}
 	}
 	if (op == "frame" || input.ReturnFrame) && status == 200 && !s.phoneSurfaceNetwork(ctx) {
-		s.retirePhoneSurface(surface, b)
+		s.retirePhoneSurfaceState(state, surface, b)
 		http.Error(w, "电脑上的 Cage 网络检查已暂停", 409)
 		return
 	}
 	if err != nil || status != 200 {
 		if op == "open" || status == 410 || status == 404 {
-			s.retirePhoneSurface(surface, b)
+			s.retirePhoneSurfaceState(state, surface, b)
 		}
 		if surface == phoneBrowser && status == http.StatusTooEarly {
 			http.Error(w, "正在启动客机浏览器", status)
 			return
 		}
 		if surface == phoneBrowser && (op == "open" || op == "frame") && status == http.StatusServiceUnavailable {
-			s.retirePhoneSurface(surface, b)
+			s.retirePhoneSurfaceState(state, surface, b)
 			http.Error(w, "客机浏览器暂时无法启动，请稍后重新打开；若仍失败，请在电脑 Cage 中检查并更新客机组件。", status)
 			return
 		}
@@ -476,22 +457,13 @@ func (s *Server) phoneSurfaceRequest(surface phoneSurface, w http.ResponseWriter
 			}
 			http.Error(w, "画面或焦点已变化，请查看最新画面后再操作", 409)
 		case 410:
-			var native windowsWindowFailure
-			if surface == phoneDesktop && errors.As(err, &native) && native.code == "requires_gui_login" {
-				http.Error(w, "请在电脑的 Cage 中解锁已绑定的 Windows 客机账户，再从手机重新打开 Claude Desktop。", 410)
-			} else {
-				http.Error(w, surface.label()+"会话已结束，请重新打开", 410)
-			}
+			http.Error(w, surface.label()+"会话已结束，请重新打开", 410)
 		case 404:
 			http.Error(w, "当前客机未提供"+surface.label()+"，请在电脑上更新环境", 409)
 		case 403:
-			if surface == phoneDesktop && s.macosGuest != nil {
-				http.Error(w, "请在电脑的 Cage 中完成虚拟 Mac 的屏幕录制和辅助功能授权，再重新打开。", 403)
-			} else {
-				http.Error(w, "客机拒绝此次访问", 403)
-			}
+			http.Error(w, "客机拒绝此次访问", 403)
 		case 426:
-			http.Error(w, "请在电脑的 Cage 中更新 Windows 客机组件，再从手机打开 Claude Desktop。", http.StatusUpgradeRequired)
+			http.Error(w, "请在电脑的 Cage 中更新客机组件，再从手机打开 Claude Desktop。", http.StatusUpgradeRequired)
 		case 501:
 			if surface == phoneDesktop {
 				http.Error(w, "请先在电脑的 Cage 中安装 Claude Desktop，再从手机打开", 501)
@@ -529,13 +501,23 @@ func (s *Server) phoneSurfaceRequest(surface phoneSurface, w http.ResponseWriter
 		out = append(out, `"action_frame":true}`...)
 	}
 	defer interruptHTTPOnCancel(w, r.WithContext(ctx))()
-	if surface == phoneDesktop && op == "frame" {
+	if surface == phoneDesktop && (op == "frame" || (op == "action" && input.ReturnFrame)) {
 		var frame map[string]json.RawMessage
-		if json.Unmarshal(out, &frame) == nil && string(frame["pixel_ratio_control"]) == "true" {
-			// Both this host and the guest understand pixel_ratio. Older hosts
-			// must keep receiving the original request shape from new clients.
-			frame["pixel_ratio_supported"] = json.RawMessage("true")
-			out, _ = json.Marshal(frame)
+		if json.Unmarshal(out, &frame) == nil {
+			changed := false
+			if string(frame["pixel_ratio_control"]) == "true" {
+				// Both this host and the guest understand pixel_ratio. Older hosts
+				// must keep receiving the original request shape from new clients.
+				frame["pixel_ratio_supported"] = json.RawMessage("true")
+				changed = true
+			}
+			if string(frame["action_frame_control"]) == "true" {
+				frame["action_frame"] = json.RawMessage("true")
+				changed = true
+			}
+			if changed {
+				out, _ = json.Marshal(frame)
+			}
 		}
 	}
 	if (op == "frame" || input.ReturnFrame) && len(out) > 3<<20 {
@@ -548,4 +530,97 @@ func (s *Server) phoneSurfaceRequest(surface phoneSurface, w http.ResponseWriter
 
 func desktopPreparing(status int) bool {
 	return status == http.StatusConflict || status == http.StatusPreconditionFailed || status == http.StatusServiceUnavailable
+}
+
+type phoneHistoryRequest struct {
+	Profile   string  `json:"profile"`
+	Mode      string  `json:"mode,omitempty"`
+	Query     string  `json:"query,omitempty"`
+	Limit     int     `json:"limit,omitempty"`
+	URL       string  `json:"url,omitempty"`
+	Range     string  `json:"range,omitempty"`
+	StartTime float64 `json:"startTime,omitempty"`
+	EndTime   float64 `json:"endTime,omitempty"`
+}
+
+func (s *Server) servePhoneHistory(w http.ResponseWriter, r *http.Request) {
+	s.phones.mu.Lock()
+	slot := s.phones.matchPhoneLocked(r)
+	var room context.Context
+	var profile string
+	if slot != nil {
+		room = slot.roomCtx
+		profile = slot.peer()
+	}
+	s.phones.mu.Unlock()
+	if slot == nil || profile == "" {
+		http.Error(w, "请通过电脑 Cage 的二维码或配对码连接这台主机，再查看浏览历史。", http.StatusForbidden)
+		return
+	}
+	epoch, _ := r.Context().Value(accountEpochKey{}).(context.Context)
+	if epoch == nil || epoch.Err() != nil {
+		http.Error(w, "请先解锁 Cage", http.StatusLocked)
+		return
+	}
+	var input browserInput
+	if r.Method == http.MethodPost {
+		if !readJSON(w, r, &input, 32<<10) {
+			return
+		}
+	}
+	if err := validBrowserHistory(&input); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	ready, closing, token := s.ready, s.closing, s.credentials.Token
+	s.mu.Unlock()
+	if !ready || closing {
+		http.Error(w, "请在电脑启动 Cage 后查看浏览历史。", http.StatusConflict)
+		return
+	}
+	payload := phoneHistoryRequest{
+		Profile:   profile,
+		Mode:      input.Mode,
+		Query:     input.Query,
+		Limit:     input.Limit,
+		URL:       input.URL,
+		Range:     input.Range,
+		StartTime: input.StartTime,
+		EndTime:   input.EndTime,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		http.Error(w, "浏览历史请求无效", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithCancel(r.Context())
+	stopRoom := context.AfterFunc(room, cancel)
+	stopEpoch := context.AfterFunc(epoch, cancel)
+	defer func() { stopEpoch(); stopRoom(); cancel() }()
+	response, err := s.browserClient().open(ctx, token, http.MethodPost, "/phone-browser/history", "application/json", bytes.NewReader(data), int64(len(data)), 15*time.Second)
+	if err != nil {
+		http.Error(w, "浏览历史暂时不可用，请检查电脑上的环境", http.StatusBadGateway)
+		return
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		switch response.StatusCode {
+		case http.StatusNotFound:
+			http.Error(w, "当前客机暂不支持浏览历史，请在电脑上更新环境。", http.StatusNotFound)
+		case http.StatusBadRequest:
+			http.Error(w, "浏览历史请求无效，请检查参数后重试。", http.StatusBadRequest)
+		default:
+			http.Error(w, "浏览历史暂时不可用，请检查电脑上的环境。", http.StatusBadGateway)
+		}
+		return
+	}
+	const limit = 1 << 20
+	out, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
+	if err != nil || len(out) > limit || !json.Valid(out) {
+		http.Error(w, "客机返回的浏览历史无效", http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(out)
 }

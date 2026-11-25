@@ -135,10 +135,10 @@ export async function createWorkbench({
         state.account.unlocked = true;
         state.account.require_authentication = false;
       } else if (action === "profile") {
-        if (state.failAccountSave) return route.fulfill({ status: 400, body: "资料未能保存，请重试" });
+        if (state.failAccountSave) return route.fulfill({ status: 400, contentType: "text/plain; charset=utf-8", body: "资料未能保存，请重试" });
         Object.assign(state.account, { username: body.username.trim(), avatar: body.avatar });
       } else if (action === "password") {
-        if (body.old_password !== state.accountPassword) return route.fulfill({ status: 400, body: "密码不正确" });
+        if (body.old_password !== state.accountPassword) return route.fulfill({ status: 400, contentType: "text/plain; charset=utf-8", body: "密码不正确" });
         if (body.password?.length < 8 || body.password !== body.confirm_password) return route.fulfill({ status: 400, body: "新密码无效" });
         state.accountPassword = body.password;
       } else if (action === "lock") { state.account.unlocked = false; state.account.require_authentication = true; }
@@ -312,6 +312,21 @@ export async function createWorkbench({
       tab.url = "cage://settings#" + (body?.mode || "general"); state.active = tab.id; result = tab;
     }
     else if (path === "/browser/extensions") result = { items: [] };
+    else if (path === "/browser/history") {
+      state.history ||= [];
+      const mode = body?.mode || "list";
+      if (mode === "delete") {
+        state.history = state.history.filter(item => item.url !== body.url);
+        result = { ok: true };
+      } else if (mode === "clear") {
+        state.history = [];
+        result = { ok: true };
+      } else {
+        const needle = String(body?.query || "").trim().toLowerCase();
+        const items = state.history.filter(item => !needle || `${item.title || ""} ${item.url || ""}`.toLowerCase().includes(needle));
+        result = { items: items.slice(0, body?.limit || 100) };
+      }
+    }
     else if (path === "/vnc-credentials") result = { password: "fixture-only" };
     else if (path === "/terminals" && request.method() === "GET")
       result = state.terminals;
@@ -384,7 +399,7 @@ export async function createWorkbench({
   });
   if (beforeNavigate) await beforeNavigate(page, state);
   await page.goto(url || process.env.CAGE_UI_URL || "http://127.0.0.1:5198");
-  if (waitForReady && !startupFailure && !state.status.vm_running && clientContext.mode !== "none") await page.getByRole("heading", { name: state.initialization.required ? state.initialization.started ? "安装并检查客机环境" : "为 Cage 准备独立环境" : "先启动 Cage 环境" }).waitFor();
+  if (waitForReady && !startupFailure && !state.status.vm_running && clientContext.mode !== "none") await page.getByRole("heading", { name: state.initialization.required ? state.initialization.started ? "安装并检查客机环境" : "为 Cage 准备独立环境" : /^(先启动 Cage 环境|Claude Cage)$/ }).waitFor();
   return { browser, context, page, state, errors };
 }
 

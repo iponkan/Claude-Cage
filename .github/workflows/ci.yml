@@ -23,7 +23,11 @@ permissions:
   contents: read
 concurrency:
   group: cage-ci-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A newer pull request or manual run replaces the older one. On main every
+  # merge already passed its pull request checks, so a running push check is
+  # allowed to finish (its packages may feed platform-preview.yml); GitHub
+  # still replaces a queued, not yet started main run with the newest push.
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 jobs:
   workflow-checks:
     runs-on: ubuntu-24.04
@@ -45,16 +49,40 @@ jobs:
       - name: Version consistency and release safety tests
         run: |
           node scripts/check-repository-files.mjs
+          node scripts/check-script-syntax.mjs
           node scripts/check-version.mjs
-          node --test scripts/release-version.test.mjs scripts/release-control.test.mjs scripts/prepare-release-assets.test.mjs scripts/esigner.test.mjs scripts/contribution-invite.test.mjs scripts/issue-system-labels.test.mjs scripts/fetch-build-artifact.test.mjs
+          node --test scripts/check-script-syntax.test.mjs scripts/release-version.test.mjs scripts/release-control.test.mjs scripts/prepare-release-assets.test.mjs scripts/esigner.test.mjs scripts/contribution-invite.test.mjs scripts/issue-system-labels.test.mjs scripts/fetch-build-artifact.test.mjs scripts/is-main-module.test.mjs scripts/bundle-qemu-sources.test.mjs scripts/agent-bootstrap.test.mjs scripts/macos-build-env.test.mjs
           pwsh -NoProfile -File scripts/test-windows-signing.ps1
       - name: Validate workflow syntax
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.11 -color
       - name: Guest creation preference contracts
         run: |
-          node scripts/guest-os/tests/browser-profile.test.mjs
           node internal/cage/device-observation.test.mjs
           node internal/cage/browser-audit.test.mjs
+          node --test internal/cage/browser-cookies.test.mjs internal/cage/tailnet-client.test.mjs ui/scripts/cursor-fallback.test.mjs
+  browser-popups:
+    needs: workflow-checks
+    # The Debian guest controller is Linux-only; hosts never run it directly.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install isolation and display tools
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap xvfb
+      - name: Test real Chromium popups through the guest browser controller
+        run: |
+          prefix="$RUNNER_TEMP/popup-playwright"
+          npm install --prefix "$prefix" --no-save --ignore-scripts playwright-core@1.65.0
+          node "$prefix/node_modules/playwright-core/cli.js" install --with-deps chromium
+          CAGE_BROWSER_TEST_CHROMIUM="$(node --input-type=module -e "const { chromium } = await import(process.argv[1]); console.log(chromium.executablePath());" "$prefix/node_modules/playwright-core/index.mjs")"
+          test -x "$CAGE_BROWSER_TEST_CHROMIUM" || { echo 'Chromium is required; popup tests must not skip.' >&2; exit 1; }
+          export CAGE_BROWSER_TEST_CHROMIUM
+          xvfb-run -a node --test internal/cage/browser-popup.integration.mjs
   macos:
     needs: workflow-checks
     uses: ./.github/workflows/macos-build.yml
@@ -73,7 +101,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON((github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') && '["windows-2025", "windows-2022"]' || '["windows-2025"]') }}
+        os: ${{ fromJSON((github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && '["windows-2025", "windows-2022"]' || '["windows-2025"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     defaults:
@@ -86,25 +114,16 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           global-json-file: global.json
+      # Same checksum-pinned ZIP cache as the windows-toolchain action, so this
+      # job does not depend on a fresh SourceForge download each run.
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/nsis-*.zip
+          key: windows-nsis-${{ hashFiles('scripts/install-nsis.ps1') }}
       - name: Install the verified NSIS compiler
         run: ./scripts/install-nsis.ps1
       - name: Install the verified WebView2 prerequisite
-        run: |
-          . ./scripts/windows-common.ps1
-          $dependency = (Get-Content packaging/windows/dependencies.json -Raw | ConvertFrom-Json).webview2
-          $cache = Join-Path $env:RUNNER_TEMP 'update-dependencies'
-          $runtime = Get-VerifiedDependency $dependency $cache
-          $signature = Get-AuthenticodeSignature -LiteralPath $runtime
-          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') { throw 'WebView2 prerequisite signature is not trusted.' }
-          $start = [Diagnostics.ProcessStartInfo]::new($runtime)
-          $start.UseShellExecute = $false
-          $start.WorkingDirectory = $cache
-          $start.ArgumentList.Add('/silent'); $start.ArgumentList.Add('/install')
-          $process = [Diagnostics.Process]::Start($start)
-          try {
-            if (!$process.WaitForExit(180000)) { $process.Kill($true); throw 'WebView2 prerequisite installation timed out.' }
-            if ($process.ExitCode -ne 0) { throw "WebView2 prerequisite failed: $($process.ExitCode)" }
-          } finally { $process.Dispose() }
+        run: ./scripts/install-webview2.ps1
       - name: Verify signed update, rejection and rollback transactions
         run: ./scripts/test-windows-update-flow.ps1
       - uses: actions/upload-artifact@v4
@@ -120,7 +139,7 @@ jobs:
       ref: ${{ github.sha }}
       release: false
       artifact_name: cage-windows-amd64-test
-      all_windows_versions: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+      all_windows_versions: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' }}
   linux:
     needs: workflow-checks
     uses: ./.github/workflows/linux-build.yml

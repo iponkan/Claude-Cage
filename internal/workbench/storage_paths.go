@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 
 	"github.com/sylvinus/agent-vm/internal/cage"
-	"github.com/sylvinus/agent-vm/internal/guestos"
 	"github.com/sylvinus/agent-vm/internal/mounts"
 	"github.com/sylvinus/agent-vm/internal/paths"
 )
@@ -41,7 +40,6 @@ func privateProjectDirectories(profile string) ([]string, error) {
 		return nil, err
 	}
 	directories = append(directories, profile)
-	directories = append(directories, guestos.WindowsPrivateStoragePaths()...)
 	for _, directory := range directories {
 		physical, err := cage.StoragePhysicalPath(directory)
 		if os.IsNotExist(err) {
@@ -77,8 +75,11 @@ func validateHostProjectData(root, profile string) error {
 		}
 	}
 	refs := mounts.Refs(paths.Host(home), "", paths.Host(defaultProfile))
-	if _, unsafe := mounts.UnsafeProject(paths.Host(root), refs); unsafe {
-		return errors.New("此目录包含或属于凭据、用户资料或版本控制数据，无法共享")
+	if _, unsafe := mounts.UnsafeLocation(paths.Host(root), refs); unsafe {
+		return errors.New("请选择具体项目，不要共享主目录、Cage 配置或包含配置的上级目录")
+	}
+	if _, unsafe := mounts.GitDirShare(paths.Host(root)); unsafe {
+		return errors.New("请选择项目根目录，不要共享 Git 等版本控制元数据目录")
 	}
 	return nil
 }

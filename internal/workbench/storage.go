@@ -5,13 +5,11 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"runtime"
 	"strings"
 
 	"github.com/sylvinus/agent-vm/internal/cage"
 	"github.com/sylvinus/agent-vm/internal/containerenv"
 	"github.com/sylvinus/agent-vm/internal/diagnostics"
-	"github.com/sylvinus/agent-vm/internal/guestos"
 )
 
 func (s *Server) localVMStorage() bool {
@@ -27,7 +25,6 @@ type storageRecoveryView struct {
 func (s *Server) storageRecoveryStatusLocked() storageRecoveryView {
 	return storageRecoveryView{
 		Required: s.storageRecoveryError != "", Error: s.storageRecoveryError,
-		RepairAllowed: s.storageRecoveryError != "" && s.windowsGuest != nil && runtime.GOOS == "windows",
 	}
 }
 
@@ -62,12 +59,12 @@ func storageRecoveryRoute(r *http.Request) bool {
 		return true
 	}
 	switch path {
-	case "/api/account", "/api/session", "/api/launch", "/api/handoff", "/api/remote/manifest", "/api/environment/storage/recover":
+	case "/api/account", "/api/session", "/api/launch", "/api/handoff", "/api/remote/manifest", "/api/environment/storage/recover", "/api/environment/device-reset/preview", "/api/environment/device-reset/execute":
 		return true
 	}
 	if r.Method == http.MethodGet {
 		switch path {
-		case "/api/status", "/api/settings", "/api/appearance", "/api/favorites", "/api/proxy", "/api/agent/routes", "/api/environment/storage", "/api/environment/initialization":
+		case "/api/status", "/api/settings", "/api/appearance", "/api/favorites", "/api/proxy", "/api/agent/routes", "/api/environment/storage", "/api/environment/initialization", "/api/environment/device-reset":
 			return true
 		}
 	}
@@ -89,29 +86,13 @@ func (s *Server) recoverEnvironmentStorage(w http.ResponseWriter, r *http.Reques
 	if !readJSON(w, r, &input) {
 		return
 	}
-	s.launch(w, "storage-recovery", func() error {
-		if input.Repair {
-			s.setMessage("正在修复 Windows 系统助手，请完成系统授权…")
-			kit, _ := s.nativeComponentKit()
-			if err := guestos.RepairWindowsHostManager(s.operationContext(), s.profile, kit, s.jobs.execution(), s.jobs.execution()); err != nil {
-				return s.failStorageRecovery(executionFailure("修复 Windows 系统助手", err, s.jobs.snapshot().Log))
-			}
-		}
+	s.launchRequest(w, r, "storage-recovery", func() error {
 		s.setMessage("正在恢复环境存储并检查数据位置…")
-		if err := guestos.RecoverWindowsStorage(s.operationContext(), s.profile); err != nil {
+		if err := cage.RecoverStorage(s.operationContext(), s.profile, nil); err != nil {
 			return s.failStorageRecovery(err)
 		}
 		if _, err := cage.GetStorageLocation(s.profile); err != nil {
 			return s.failStorageRecovery(err)
-		}
-		if s.windowsGuest != nil {
-			binding, err := guestos.LoadWindowsProfile(s.profile)
-			if err != nil {
-				return s.failStorageRecovery(err)
-			}
-			if binding == nil || binding.VMID != s.windowsGuest.VMID || binding.GUIUserSID != s.windowsGuest.GUIUserSID {
-				return s.failStorageRecovery(errors.New("Windows 客机绑定已改变，请重新打开原工作台后恢复"))
-			}
 		}
 		if err := s.prepareEnvironment(); err != nil {
 			return s.failStorageRecovery(err)
@@ -135,6 +116,13 @@ func (s *Server) environmentStorage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		location, err := cage.GetStorageLocation(s.profile)
+		if errors.Is(err, cage.ErrStorageMissing) {
+			jsonReply(w, struct {
+				cage.StorageLocation
+				Error string `json:"error"`
+			}{location, err.Error()})
+			return
+		}
 		if err != nil {
 			if errors.Is(err, cage.ErrStorageRuntimeRecovery) {
 				s.failStorageRecovery(err)
@@ -166,19 +154,20 @@ func (s *Server) environmentStorage(w http.ResponseWriter, r *http.Request) {
 		Directory string `json:"directory"`
 		Previous  string `json:"previous"`
 		Migrate   bool   `json:"migrate"`
+		Missing   bool   `json:"missing"`
 	}
 	if !readJSON(w, r, &input) {
 		return
 	}
-	s.launch(w, "storage", func() error {
-		if err := guestos.RecoverWindowsStorage(s.operationContext(), s.profile); err != nil {
+	s.launchRequest(w, r, "storage", func() error {
+		if err := cage.RecoverStorage(s.operationContext(), s.profile, nil); err != nil {
 			return s.failStorageRecovery(err)
 		}
 		current, err := cage.GetStorageLocation(s.profile)
-		if err != nil {
+		if err != nil && !(input.Missing && errors.Is(err, cage.ErrStorageMissing)) {
 			return err
 		}
-		if current.Directory != input.Previous || current.HasEnvironment != input.Migrate {
+		if current.Directory != input.Previous || current.HasEnvironment != input.Migrate || current.Missing != input.Missing {
 			return errors.New("环境或存储位置已改变，请重新打开设置后再选择")
 		}
 		if err = cage.ValidateStorageTarget(s.profile, input.Directory); err != nil {
@@ -197,9 +186,6 @@ func (s *Server) environmentStorage(w http.ResponseWriter, r *http.Request) {
 		}
 		s.setMessage("正在检查环境存储…")
 		var runtime cage.StorageRuntime
-		if s.windowsGuest != nil {
-			runtime = guestos.WindowsStorageRuntime(s.profile)
-		}
 		_, err = cage.MoveStorageWithRuntime(s.operationContext(), s.profile, input.Directory, current, runtime, func(copied, total int64) {
 			s.setMessage(fmt.Sprintf("正在迁移环境数据 · %.1f / %.1f GiB", float64(copied)/(1<<30), float64(total)/(1<<30)))
 		})

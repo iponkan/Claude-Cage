@@ -49,6 +49,20 @@ func testPairedBrowser(t *testing.T, ctx context.Context, s *Server, phone *mobi
 	receiving := make(chan struct{})
 	id := uuid.NewString()
 	s.browserControl = browserClientForTest(t, s, browserTransport(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/phone-browser/history" {
+			var req phoneHistoryRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Error(err)
+			}
+			if req.Profile != profile {
+				t.Errorf("history profile mismatch: got %q", req.Profile)
+			}
+			reply := `{"items":[{"id":"https://youtube.com/","url":"https://youtube.com/","title":"YouTube","lastVisitTime":1700000000000,"visitCount":1}]}`
+			if req.Mode != "list" {
+				reply = `{"ok":true}`
+			}
+			return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(reply))}, nil
+		}
 		var input phoneSurfaceInput
 		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 			t.Error(err)
@@ -105,10 +119,14 @@ func testPairedBrowser(t *testing.T, ctx context.Context, s *Server, phone *mobi
 			}
 			body = fmt.Sprintf(`{"id":%q,"document":"test","window":"desktop","image":"ZGVza3RvcA==","width":390,"height":640}`, id)
 			if desktopDensity.Load() {
-				body = strings.TrimSuffix(body, "}") + `,"pixel_ratio_control":true,"pixel_ratio":3.5,"requested_pixel_ratio":3.5}`
+				body = strings.TrimSuffix(body, "}") + `,"pixel_ratio_control":true,"action_frame_control":true,"pixel_ratio":3.5,"requested_pixel_ratio":3.5}`
 			}
 		case "/phone-desktop/action":
 			if input.Type == "resize" && input.PixelRatio == 3.5 && input.Width == 390 && input.Height == 640 {
+				break
+			}
+			if input.Type == "scroll" && input.Document == "test" && input.ReturnFrame && input.DY != nil && *input.DY == 150 {
+				body = fmt.Sprintf(`{"id":%q,"document":"test","window":"desktop","image":"c2Nyb2xsZWQ=","width":390,"height":640,"action_frame_control":true}`, id)
 				break
 			}
 			if input.Type != "login" || input.Document != "test" {
@@ -176,8 +194,15 @@ func testPairedBrowser(t *testing.T, ctx context.Context, s *Server, phone *mobi
 	screen("POST", id+"/action", `{"type":"navigate","url":"https://example.test"}`, 400)
 	screen("POST", id+"/action", `{"type":"login","document":"test"}`, 200)
 	desktopDensity.Store(true)
-	if !strings.Contains(screen("GET", id+"/frame", "", 200), `"pixel_ratio_supported":true`) {
+	desktopFrame := screen("GET", id+"/frame", "", 200)
+	if !strings.Contains(desktopFrame, `"pixel_ratio_supported":true`) {
 		t.Fatal("host did not negotiate pixel density with a capable guest")
+	}
+	if !strings.Contains(desktopFrame, `"action_frame":true`) {
+		t.Fatal("host did not negotiate action frames for capable desktop guest")
+	}
+	if out := screen("POST", id+"/action", `{"type":"scroll","x":120,"y":300,"dx":0,"dy":150,"document":"test","return_frame":true}`, 200); !strings.Contains(out, `"image":"c2Nyb2xsZWQ="`) || !strings.Contains(out, `"action_frame":true`) {
+		t.Fatalf("desktop scroll action frame was not returned: %s", out)
 	}
 	screen("POST", id+"/action", `{"type":"resize","width":390,"height":640,"pixel_ratio":3.5}`, 200)
 	screen("POST", id+"/action", `{"type":"resize","width":390,"height":640,"pixel_ratio":-1}`, 400)
@@ -212,6 +237,12 @@ func testPairedBrowser(t *testing.T, ctx context.Context, s *Server, phone *mobi
 	do("POST", id+"/action", `{"type":"cdp"}`, 400)
 	do("GET", uuid.NewString()+"/frame", "", 410)
 	do("POST", id+"/close", "{}", 200)
+	if reply := do("GET", "history", "", 200); !strings.Contains(reply, "youtube.com") {
+		t.Fatalf("expected phone history list, got %s", reply)
+	}
+	do("POST", "history", `{"mode":"delete","url":"https://youtube.com/"}`, 200)
+	do("POST", "history", `{"mode":"clear","range":"day"}`, 200)
+	do("POST", "history", `{"mode":"delete","url":"javascript:alert(1)"}`, 400)
 	do("POST", "open", strings.Replace(open, `"width"`, `"url":"https://claude.ai/","width"`, 1), 200)
 	if url := <-openedURLs; url != "https://claude.ai/" {
 		t.Fatal("explicit shortcut overridden by home")

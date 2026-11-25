@@ -34,7 +34,7 @@ func TestMaintenanceRequiresAuthenticationAndSoftwareSource(t *testing.T) {
 	defer upstream.Close()
 	destination, _ := url.Parse(upstream.URL)
 	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
-		if address != "deb.debian.org:80" && address != "deb.nodesource.com:80" && address != "archive.ubuntu.com:80" && address != "security.ubuntu.com:80" && address != "ports.ubuntu.com:80" {
+		if address != "deb.debian.org:80" && address != "deb.nodesource.com:80" {
 			return nil, errors.New("unexpected destination")
 		}
 		return (&net.Dialer{}).DialContext(ctx, network, destination.Host)
@@ -43,9 +43,17 @@ func TestMaintenanceRequiresAuthenticationAndSoftwareSource(t *testing.T) {
 	server := httptest.NewServer(proxy)
 	defer server.Close()
 	defer proxy.close()
-	gate, err := cage.NewEgressGate(cage.DefaultConfig())
-	if err != nil {
+	s, gate := grantedToolUpdateServer(t)
+	_, _, recoveryErr := parseGuestConnection([]byte("{\"token\":\"fixture\"}\npassword\n{\"updating\":true}"))
+	if !errors.Is(recoveryErr, errGuestRecoveryRequired) || !guestComponentsUnavailable(recoveryErr) {
+		t.Fatal("interrupted start did not enter the component recovery path", recoveryErr)
+	}
+	if err := s.closeProxyGate(recoveryErr.Error()); err != nil {
 		t.Fatal(err)
+	}
+	if conn, err := gate.DialContext(context.Background(), "tcp", "example.com:443"); err == nil {
+		conn.Close()
+		t.Fatal("component recovery allowed agent traffic")
 	}
 	for _, test := range []struct {
 		target, method string
@@ -59,9 +67,6 @@ func TestMaintenanceRequiresAuthenticationAndSoftwareSource(t *testing.T) {
 		{"http://deb.debian.org/debian/pool/file.deb", "POST", true, 405},
 		{"http://deb.debian.org/debian/pool/file.deb", "GET", true, 200},
 		{"http://deb.nodesource.com/node_24.x/dists/nodistro/InRelease", "GET", true, 200},
-		{"http://archive.ubuntu.com/ubuntu/dists/jammy/InRelease", "GET", true, 200},
-		{"http://security.ubuntu.com/ubuntu/dists/jammy-security/InRelease", "GET", true, 200},
-		{"http://ports.ubuntu.com/ubuntu-ports/dists/jammy/InRelease", "GET", true, 200},
 	} {
 		proxyURL, _ := url.Parse(server.URL)
 		if test.auth {
@@ -84,7 +89,7 @@ func TestMaintenanceRequiresAuthenticationAndSoftwareSource(t *testing.T) {
 			t.Fatal("download bytes changed")
 		}
 	}
-	if calls.Load() != 5 {
+	if calls.Load() != 2 {
 		t.Fatal("rejected request reached origin")
 	}
 	if gate.Status().Mode != cage.GateClosed {
@@ -150,12 +155,35 @@ func TestMaintenanceScriptUsesPrivateTemporaryConfiguration(t *testing.T) {
 test "$http_proxy" = "$CAGE_INSTALL_PROXY"
 test "$(umask)" = 0022
 printf '%s' "$CAGE_APT_CONFIG"
-`, "fixture-token"))
+	`, "fixture-token", false))
 	output, err := command.Output()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err = os.Stat(string(output)); !os.IsNotExist(err) {
 		t.Fatal("maintenance credential was retained")
+	}
+}
+
+func TestContainerMaintenanceKeepsAPTArchivesOutsideDefaultCleanup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the installer Bash script runs in the Linux guest, not the Windows host")
+	}
+	shell, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not available")
+	}
+	command := exec.Command(shell, "-se")
+	command.Stdin = strings.NewReader(`sudo() {
+  test "$*" = "install -d -m 0755 /var/cache/apt/install-archives"
+}
+` + maintenanceScript(`sed -n '/^Dir::Cache::archives /p' "$CAGE_APT_CONFIG"
+`, "fixture-token", true))
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run maintenance script: %v\n%s", err, output)
+	}
+	if got := strings.TrimSpace(string(output)); got != `Dir::Cache::archives "/var/cache/apt/install-archives";` {
+		t.Fatalf("unexpected managed APT archive directory: %q", got)
 	}
 }

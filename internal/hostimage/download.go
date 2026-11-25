@@ -65,7 +65,7 @@ func (r *progressReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func verify(ctx context.Context, path string, plan Plan, output io.Writer, transport http.RoundTripper) (string, error) {
+func verify(ctx context.Context, path string, plan Plan, output io.Writer) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -99,17 +99,6 @@ func verify(ctx context.Context, path string, plan Plan, output io.Writer, trans
 	if plan.Digest != "" && actual != plan.Digest {
 		return "", errors.New("系统镜像摘要不匹配，请重新选择或重新下载")
 	}
-	if plan.Format == "ipsw" {
-		version, build, err := macImageIdentity(path)
-		if err != nil || version != plan.Version || build != plan.Build {
-			return "", errors.New("恢复镜像内容与已选择的 macOS 版本不一致")
-		}
-	}
-	if plan.Format == "pkgdmg" {
-		if err := verifyIntelPackage(ctx, path, plan, transport); err != nil {
-			return "", err
-		}
-	}
 	return actual, nil
 }
 
@@ -119,12 +108,15 @@ func Prepare(ctx context.Context, cache string, plan Plan, output io.Writer, tra
 	if err := plan.Validate(); err != nil {
 		return Plan{}, err
 	}
+	if abandonedSystem(plan.Host.System) {
+		return Plan{}, errors.New("Cage 已不再支持安装此系统的客机，原有安装材料未被改动")
+	}
 	if output == nil {
 		output = io.Discard
 	}
 	if plan.Path != "" {
 		fmt.Fprintln(output, "正在校验系统镜像…")
-		digest, err := verify(ctx, plan.Path, plan, output, transport)
+		digest, err := verify(ctx, plan.Path, plan, output)
 		if err != nil {
 			return Plan{}, err
 		}
@@ -206,7 +198,7 @@ func Prepare(ctx context.Context, cache string, plan Plan, output io.Writer, tra
 	if err = file.Close(); err != nil {
 		return Plan{}, err
 	}
-	digest, err := verify(ctx, filepath.Join(cache, partial), plan, output, transport)
+	digest, err := verify(ctx, filepath.Join(cache, partial), plan, output)
 	if err != nil {
 		// Preserve the failed download for diagnosis. A new attempt can resume
 		// into a new partial file, without reusing corrupt bytes.
@@ -227,6 +219,8 @@ func Prepare(ctx context.Context, cache string, plan Plan, output io.Writer, tra
 	return plan, Save(cache, plan)
 }
 
+const downloadUserAgent = "Wget/1.21.4 (linux-gnu)"
+
 func download(ctx context.Context, plan Plan, file *os.File, offset int64, output io.Writer, transport http.RoundTripper) error {
 	client := &http.Client{Transport: transport, Timeout: 2 * time.Hour, CheckRedirect: func(request *http.Request, previous []*http.Request) error {
 		if len(previous) >= 5 {
@@ -240,7 +234,7 @@ func download(ctx context.Context, plan Plan, file *os.File, offset int64, outpu
 		return err
 	}
 	request.Header.Set("Accept-Encoding", "identity")
-	request.Header.Set("User-Agent", "Mozilla/5.0 (compatible; Cage-SystemInstaller/1.0)")
+	request.Header.Set("User-Agent", downloadUserAgent)
 	if offset > 0 {
 		request.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 	}

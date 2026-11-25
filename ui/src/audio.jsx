@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { Volume2, VolumeX } from "lucide-react";
+import { Mic, MicOff, Volume2, VolumeX } from "lucide-react";
 import { AudioOutput } from "./audio-output";
+import { AudioInput } from "./audio-input";
+import { useTranslation } from "./interface-language.mjs";
 
 function savedAudio() {
   try {
@@ -43,7 +45,64 @@ export function useAudioOutput(enabled) {
   } };
 }
 
+export function useAudioInput(enabled) {
+  const [status, setStatus] = useState({ demand: false, state: "idle" });
+  const [error, setError] = useState("");
+  const capture = useRef();
+  useEffect(() => {
+    const input = new AudioInput(setStatus, setError);
+    capture.current = input;
+    const shutdown = () => input.disconnect();
+    window.addEventListener("pagehide", shutdown);
+    return () => {
+      window.removeEventListener("pagehide", shutdown);
+      input.close();
+      capture.current = null;
+    };
+  }, []);
+  useEffect(() => {
+    capture.current?.setActive(enabled);
+  }, [enabled]);
+  return {
+    demand: status.demand,
+    state: status.state,
+    error,
+    retry: () => capture.current?.retry(),
+  };
+}
+
+export function MicrophoneIndicator({ mic }) {
+  const tr = useTranslation();
+  if (!mic?.demand) return null;
+  const active = mic.state === "capturing" || mic.state === "starting";
+  if (active) {
+    const label = tr("环境正在使用麦克风");
+    return (
+      <span className="mic-indicator active" role="status" aria-label={label} title={label}>
+        <span className="mic-dot" aria-hidden="true" />
+        <Mic size={14} />
+      </span>
+    );
+  }
+  const message =
+    mic.state === "denied"
+      ? tr("麦克风权限未授予，请在系统设置中允许 Cage 使用麦克风后点击重试")
+      : mic.state === "no-device"
+        ? tr("未检测到可用的本机麦克风")
+        : mic.state === "unsupported"
+          ? tr("当前窗口不支持麦克风采集")
+          : mic.state === "disconnected"
+            ? tr("本机麦克风已断开，请检查设备后点击重试")
+            : tr("麦克风采集未能启动，请检查本机音频设备后重试");
+  return (
+    <button className="mic-indicator error" type="button" onClick={mic.retry} aria-label={message} title={message}>
+      <MicOff size={14} />
+    </button>
+  );
+}
+
 export function AudioControls({ audio }) {
+  const tr = useTranslation();
   const [open, setOpen] = useState(false);
   const controls = useRef(null);
   const keyboardOpened = useRef(false);
@@ -60,8 +119,8 @@ export function AudioControls({ audio }) {
     if (!audio.enabled) setOpen(false);
   }, [audio.enabled]);
   const silent = audio.muted || audio.volume === 0;
-  const label = !audio.enabled ? "环境声音：未启动" : !open ? "打开音量控制" : silent ? "取消静音" : "静音";
-  const status = audio.error || (audio.state === "unsupported" ? "当前窗口不支持声音播放" : audio.state === "disconnected" ? "声音连接中断，正在重连" : "");
+  const label = tr(!audio.enabled ? "环境声音：未启动" : !open ? "打开音量控制" : silent ? "取消静音" : "静音");
+  const status = tr(audio.error || (audio.state === "unsupported" ? "当前窗口不支持声音播放" : audio.state === "disconnected" ? "声音连接中断，正在重连" : ""));
   return <div className="audio-controls" ref={controls}
     onPointerLeave={event => { pressingSpeaker.current = false; if (event.pointerType !== "touch") setOpen(false); }}
     onBlur={event => { if (!pressingSpeaker.current && !event.currentTarget.contains(event.relatedTarget)) setOpen(false); }}
@@ -70,7 +129,7 @@ export function AudioControls({ audio }) {
       {silent ? <VolumeX size={15} /> : <Volume2 size={15} />}
     </button>
     {open && <div className="audio-volume-panel">
-      <input type="range" aria-label="环境音量" title={`环境音量 ${Math.round(audio.volume * 100)}%`} min="0" max="100" step="1" value={Math.round(audio.volume * 100)} style={{ "--volume-level": `${Math.round(audio.volume * 100)}%` }} disabled={!audio.enabled} autoFocus={keyboardOpened.current} onChange={e => audio.volumeChange(Number(e.target.value) / 100)} onKeyDown={event => {
+      <input type="range" aria-label={tr("环境音量")} title={tr("环境音量 {0}%", (Math.round(audio.volume * 100)))} min="0" max="100" step="1" value={Math.round(audio.volume * 100)} style={{ "--volume-level": `${Math.round(audio.volume * 100)}%` }} disabled={!audio.enabled} autoFocus={keyboardOpened.current} onChange={e => audio.volumeChange(Number(e.target.value) / 100)} onKeyDown={event => {
         const value = Math.round(audio.volume * 100);
         const next = { ArrowUp: value + 1, ArrowRight: value + 1, ArrowDown: value - 1, ArrowLeft: value - 1, Home: 0, End: 100, PageUp: value + 10, PageDown: value - 10 }[event.key];
         if (next !== undefined) { event.preventDefault(); audio.volumeChange(Math.max(0, Math.min(100, next)) / 100); }

@@ -29,6 +29,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/lima-vm/lima/v2/pkg/fileutils"
+	"github.com/lima-vm/lima/v2/pkg/guestidentity"
 	"github.com/lima-vm/lima/v2/pkg/iso9660util"
 	"github.com/lima-vm/lima/v2/pkg/limatype"
 	"github.com/lima-vm/lima/v2/pkg/limatype/filenames"
@@ -152,7 +153,7 @@ func EnsureDisk(ctx context.Context, cfg Config) error {
 }
 
 func newQmpClient(cfg Config) (*qmp.SocketMonitor, error) {
-	qmpSock := filepath.Join(cfg.InstanceDir, filenames.QMPSock)
+	qmpSock := filepath.Join(socketDir(cfg.InstanceDir), filenames.QMPSock)
 	qmpClient, err := qmp.NewSocketMonitor("unix", qmpSock, 5*time.Second)
 	if err != nil {
 		return nil, err
@@ -706,10 +707,10 @@ func cmdline(ctx context.Context, cfg Config, workingDir *string) (exe string, a
 	isoPresent := osutil.FileExists(isoPath)
 	if osutil.FileExists(diskPath) {
 		if isoPresent {
-			args = append(args, "-drive", fmt.Sprintf("file=%s,if=virtio,discard=on", diskPath))
+			args = append(args, "-drive", fmt.Sprintf("file=%s,if=virtio,discard=unmap,detect-zeroes=unmap", diskPath))
 		} else {
 			// bootindex=1 fixes non-deterministic boot order when extra disks are present (#4936)
-			args = append(args, "-drive", fmt.Sprintf("file=%s,if=none,discard=on,id=boot-disk", diskPath))
+			args = append(args, "-drive", fmt.Sprintf("file=%s,if=none,discard=unmap,detect-zeroes=unmap,id=boot-disk", diskPath))
 			args = append(args, "-device", fmt.Sprintf("%s,drive=boot-disk,bootindex=1", virtioBlk))
 		}
 	}
@@ -978,7 +979,7 @@ func cmdline(ctx context.Context, cfg Config, workingDir *string) (exe string, a
 
 	// Serial (default)
 	// This is ttyS0 for Intel and RISC-V, ttyAMA0 for ARM.
-	serialSock := filepath.Join(cfg.InstanceDir, filenames.SerialSock)
+	serialSock := filepath.Join(socketDir(cfg.InstanceDir), filenames.SerialSock)
 	if err := os.RemoveAll(serialSock); err != nil {
 		return "", nil, err
 	}
@@ -995,7 +996,7 @@ func cmdline(ctx context.Context, cfg Config, workingDir *string) (exe string, a
 	// https://gitlab.com/qemu-project/qemu/-/issues/1801#note_1494720586
 	switch *y.Arch {
 	case limatype.AARCH64, limatype.ARMV7L:
-		serialpSock := filepath.Join(cfg.InstanceDir, filenames.SerialPCISock)
+		serialpSock := filepath.Join(socketDir(cfg.InstanceDir), filenames.SerialPCISock)
 		if err := os.RemoveAll(serialpSock); err != nil {
 			return "", nil, err
 		}
@@ -1011,7 +1012,7 @@ func cmdline(ctx context.Context, cfg Config, workingDir *string) (exe string, a
 	// Serial (virtio)
 	// Skip it for Windows guest because we encountered a problem around vioser.sys.
 	if *y.OS != limatype.WINDOWS {
-		serialvSock := filepath.Join(cfg.InstanceDir, filenames.SerialVirtioSock)
+		serialvSock := filepath.Join(socketDir(cfg.InstanceDir), filenames.SerialVirtioSock)
 		if err := os.RemoveAll(serialvSock); err != nil {
 			return "", nil, err
 		}
@@ -1066,7 +1067,7 @@ func cmdline(ctx context.Context, cfg Config, workingDir *string) (exe string, a
 	}
 
 	// QMP
-	qmpSock := filepath.Join(cfg.InstanceDir, filenames.QMPSock)
+	qmpSock := filepath.Join(socketDir(cfg.InstanceDir), filenames.QMPSock)
 	if err := os.RemoveAll(qmpSock); err != nil {
 		return "", nil, err
 	}
@@ -1076,21 +1077,36 @@ func cmdline(ctx context.Context, cfg Config, workingDir *string) (exe string, a
 
 	if cfg.VirtioGA {
 		// Guest agent via serialport
-		guestSock := filepath.Join(cfg.InstanceDir, filenames.GuestAgentSock)
+		guestSock := filepath.Join(socketDir(cfg.InstanceDir), filenames.GuestAgentSock)
 		args = append(args, "-chardev", fmt.Sprintf("socket,path=%s,server=on,wait=off,id=qga0", guestSock))
 		args = append(args, "-device", "virtio-serial")
 		args = append(args, "-device", "virtserialport,chardev=qga0,name="+filenames.VirtioPort)
 	}
 
-	if y.GuestIdentity != nil {
-		args = append(args, "-uuid", y.GuestIdentity.UUID)
-	}
+	args = append(args, guestIdentityArgs(y.GuestIdentity)...)
 
 	// QEMU process
 	args = append(args, "-name", "lima-"+cfg.Name)
 	args = append(args, "-pidfile", filepath.Join(cfg.InstanceDir, filenames.PIDFile(*y.VMType)))
 
 	return exe, args, nil
+}
+
+func guestIdentityArgs(identity *guestidentity.Identity) []string {
+	if identity == nil {
+		return nil
+	}
+	args := []string{"-uuid", identity.UUID}
+	if identity.SystemSerial != "" {
+		args = append(args, "-smbios", fmt.Sprintf("type=1,uuid=%s,serial=%s", identity.UUID, identity.SystemSerial))
+	}
+	if identity.BoardSerial != "" {
+		args = append(args, "-smbios", fmt.Sprintf("type=2,serial=%s", identity.BoardSerial))
+	}
+	if identity.ChassisSerial != "" {
+		args = append(args, "-smbios", fmt.Sprintf("type=3,serial=%s", identity.ChassisSerial))
+	}
+	return args
 }
 
 func FindVirtiofsd(ctx context.Context, qemuExe string) (string, error) {

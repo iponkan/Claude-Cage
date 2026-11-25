@@ -1,7 +1,6 @@
 package workbench
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -9,7 +8,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"time"
 	"unicode/utf8"
 )
 
@@ -94,51 +92,13 @@ func (s *Server) projectAdditionalDirectories(workspace string) ([]string, error
 		if _, err := s.projectWorkspace(folder); err != nil {
 			return nil, err
 		}
-		directory := s.cliWorkspace(folder)
-		if s.windowsGuest != nil {
-			binding, err := s.windowsProjectForHost(folder)
-			if err != nil {
-				return nil, err
-			}
-			directory = binding.Path
-		}
+		directory := guestPath(folder)
 		directories = append(directories, directory)
 	}
 	return directories, nil
 }
 
-// Saving and opening share the macOS approval flow. Approval never persists a
-// partial group; the caller retries the complete request after GUI approval.
-func (s *Server) projectConnectionError(w http.ResponseWriter, err error, folder string) {
-	if errors.Is(err, errMacOSProjectApproval) {
-		if canonical, pathErr := validateWorkspace(folder, s.profile); pathErr == nil {
-			folder = canonical
-		}
-		folders, _ := s.projectFolders(folder)
-		s.mu.Lock()
-		for _, member := range folders {
-			if share := s.projectShares[member]; share != nil && share.approval != "" {
-				folder = member
-				break
-			}
-		}
-		share := s.projectShares[folder]
-		grant := ""
-		if share != nil {
-			grant = share.approval
-		}
-		s.mu.Unlock()
-		if grant != "" {
-			ctx, cancel := context.WithTimeout(s.operationContext(), 5*time.Second)
-			_, openErr := s.guestControl(ctx, "/usr/bin/open -a /Applications/CageProjectAccess.app", "macos-project-approval")
-			cancel()
-			if openErr == nil {
-				jsonReply(w, map[string]string{"workspace": folder, "approval": grant})
-				return
-			}
-			err = &projectShareError{Recovery: "project-approval", Message: "未能显示项目授权窗口，请重试"}
-		}
-	}
+func (s *Server) projectConnectionError(w http.ResponseWriter, err error) {
 	var failure *projectShareError
 	if errors.As(err, &failure) && failure.Recovery != "" {
 		w.Header().Set("X-Cage-Recovery", failure.Recovery)
@@ -164,7 +124,7 @@ func (s *Server) saveProject(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	ready, closing := s.ready, s.closing
 	s.mu.Unlock()
-	if closing || !ready || s.busy() {
+	if closing || s.busy() {
 		http.Error(w, "环境尚未就绪或正在处理其他操作，请稍后重试", http.StatusConflict)
 		return
 	}
@@ -178,22 +138,6 @@ func (s *Server) saveProject(w http.ResponseWriter, r *http.Request) {
 		requestError(w, err)
 		return
 	}
-	// Validate every directory before opening any transport, including aliases.
-	folders := []string{}
-	for _, folder := range input.Folders {
-		if isClientMountPath(folder) {
-			http.Error(w, "临时客户端共享请单独管理", http.StatusBadRequest)
-			return
-		}
-		path, err := validateWorkspace(folder, s.profile)
-		if err != nil {
-			requestError(w, err)
-			return
-		}
-		if !slices.Contains(folders, path) {
-			folders = append(folders, path)
-		}
-	}
 	var previous *projectGroup
 	if input.Workspace != "" {
 		for _, group := range groups {
@@ -203,6 +147,56 @@ func (s *Server) saveProject(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 		}
+	}
+	renameOnly := false
+	if previous != nil {
+		unique := []string{}
+		for _, folder := range input.Folders {
+			if !slices.Contains(unique, folder) {
+				unique = append(unique, folder)
+			}
+		}
+		if len(unique) == len(previous.Folders) {
+			renameOnly = true
+			for _, folder := range unique {
+				if !slices.Contains(previous.Folders, folder) {
+					renameOnly = false
+					break
+				}
+			}
+		}
+	}
+	// A rename is stored with the saved projects. A temporary client share
+	// lives only while its client is connected and must not be persisted.
+	if renameOnly && slices.ContainsFunc(previous.Folders, isClientMountPath) {
+		http.Error(w, "临时客户端共享请单独管理", http.StatusBadRequest)
+		return
+	}
+	if !renameOnly && !ready {
+		http.Error(w, "环境尚未就绪或正在处理其他操作，请稍后重试", http.StatusConflict)
+		return
+	}
+	// Validate every directory before opening any transport, including aliases.
+	folders := []string{}
+	if renameOnly {
+		folders = slices.Clone(previous.Folders)
+	} else {
+		for _, folder := range input.Folders {
+			if isClientMountPath(folder) {
+				http.Error(w, "临时客户端共享请单独管理", http.StatusBadRequest)
+				return
+			}
+			path, err := validateWorkspace(folder, s.profile)
+			if err != nil {
+				requestError(w, err)
+				return
+			}
+			if !slices.Contains(folders, path) {
+				folders = append(folders, path)
+			}
+		}
+	}
+	if input.Workspace != "" {
 		if previous == nil || !slices.Contains(folders, input.Workspace) {
 			http.Error(w, "请保留项目的默认文件夹，以继续使用已有会话历史", http.StatusBadRequest)
 			return
@@ -243,44 +237,80 @@ func (s *Server) saveProject(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
-	// Failed creation must not leave new, invisible directory transports alive.
-	// Keep a pending macOS approval until the same save request is retried.
-	s.mu.Lock()
-	initialShares := make(map[string]*projectShare, len(folders))
-	for _, folder := range folders {
-		initialShares[folder] = s.projectShares[folder]
-	}
-	s.mu.Unlock()
-	committed, approving := false, false
-	defer func() {
-		if committed || approving {
-			return
-		}
-		var created []string
+	if !renameOnly {
+		// Failed creation must not leave new, invisible directory transports alive.
 		s.mu.Lock()
+		initialShares := make(map[string]*projectShare, len(folders))
 		for _, folder := range folders {
-			if initialShares[folder] == nil && s.projectShares[folder] != nil {
-				created = append(created, folder)
-			}
+			initialShares[folder] = s.projectShares[folder]
 		}
 		s.mu.Unlock()
-		s.detachProjectFolders(created)
-	}()
-	for _, folder := range folders {
-		if err := s.ensureProjectShare(folder); err != nil {
-			approving = errors.Is(err, errMacOSProjectApproval)
-			s.projectConnectionError(w, err, folder)
+		committed := false
+		defer func() {
+			if committed {
+				return
+			}
+			var created []string
+			s.mu.Lock()
+			for _, folder := range folders {
+				if initialShares[folder] == nil && s.projectShares[folder] != nil {
+					created = append(created, folder)
+				}
+			}
+			s.mu.Unlock()
+			s.detachProjectFolders(created)
+		}()
+		for _, folder := range folders {
+			if err := s.ensureProjectShare(folder); err != nil {
+				s.projectConnectionError(w, err)
+				return
+			}
+		}
+		defer func() {
+			if committed {
+				s.detachProjectFolders(removed)
+			}
+		}()
+		input.Folders = append([]string{input.Workspace}, slices.DeleteFunc(slices.Clone(folders), func(p string) bool { return p == input.Workspace })...)
+		// Preserve the legacy current grant even when it was never in paths.
+		paths, err := s.projectPaths()
+		if err != nil {
+			requestError(w, err)
 			return
 		}
+		saved.Paths = slices.DeleteFunc(paths, func(p string) bool { return isClientMountPath(p) || slices.Contains(removed, p) })
+		for _, folder := range folders {
+			if !slices.Contains(saved.Paths, folder) {
+				saved.Paths = append(saved.Paths, folder)
+			}
+		}
+		index := slices.IndexFunc(saved.Groups, func(g projectGroup) bool { return g.Workspace == input.Workspace })
+		if index >= 0 {
+			saved.Groups[index] = input
+		} else {
+			saved.Groups = append(saved.Groups, input)
+		}
+		// A removed member may be the legacy current selection. Change it before
+		// dropping its grant so projectPaths cannot resurrect it.
+		if err := s.replaceRemovedWorkspace(removed, input.Workspace); err != nil {
+			requestError(w, err)
+			return
+		}
+		if err := writePrivate(filepath.Join(s.profile, "projects.json"), saved); err != nil {
+			requestError(w, err)
+			return
+		}
+		committed = true
+		jsonReply(w, input)
+		return
 	}
 	input.Folders = append([]string{input.Workspace}, slices.DeleteFunc(slices.Clone(folders), func(p string) bool { return p == input.Workspace })...)
-	// Preserve the legacy current grant even when it was never in paths.
 	paths, err := s.projectPaths()
 	if err != nil {
 		requestError(w, err)
 		return
 	}
-	saved.Paths = slices.DeleteFunc(paths, func(p string) bool { return isClientMountPath(p) || slices.Contains(removed, p) })
+	saved.Paths = slices.DeleteFunc(paths, isClientMountPath)
 	for _, folder := range folders {
 		if !slices.Contains(saved.Paths, folder) {
 			saved.Paths = append(saved.Paths, folder)
@@ -292,17 +322,9 @@ func (s *Server) saveProject(w http.ResponseWriter, r *http.Request) {
 	} else {
 		saved.Groups = append(saved.Groups, input)
 	}
-	// A removed member may be the legacy current selection. Change it before
-	// dropping its grant so projectPaths cannot resurrect it.
-	if err := s.replaceRemovedWorkspace(removed, input.Workspace); err != nil {
-		requestError(w, err)
-		return
-	}
 	if err := writePrivate(filepath.Join(s.profile, "projects.json"), saved); err != nil {
 		requestError(w, err)
 		return
 	}
-	committed = true
-	s.detachProjectFolders(removed)
 	jsonReply(w, input)
 }

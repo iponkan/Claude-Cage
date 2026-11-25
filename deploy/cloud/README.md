@@ -14,7 +14,7 @@
 
 当前构建基线为 Linux x86_64、cgroup v2、systemd 用户服务及 rootless Docker 29.9.1。服务器无需 KVM。运行用户须有可用的多 UID/GID 用户命名空间、至少 65,536 个 subordinate UID/GID，以及可访问的 `/dev/fuse`、`/dev/net/tun`。`newuidmap`、`newgidmap` 可通过发行版的 setuid 或文件 capability 实现映射。
 
-宿主需提供 OpenSSH、curl、tar、sha256sum、iproute2 与 iptables；Cage 服务端不依赖 GTK 或 WebKit。实际运行还会检查用户 cgroup 委派和父层资源上限。缺少前提时应修复服务器配置，不能通过 `--privileged`、宿主网络、宿主 PID、Docker socket 挂载或整个宿主 cgroup 的可写绑定启动工作环境。
+宿主需提供 OpenSSH、curl、tar、sha256sum、iproute2 与 iptables；Cage 服务端不依赖 GTK 或 WebKit。部署预检要求 `user@<UID>.service` 委派 `cpu`、`memory`、`pids`（读不到用户管理器 cgroup 时不判定），实际运行还会检查父层资源上限。缺少前提时应修复服务器配置，不能通过 `--privileged`、宿主网络、宿主 PID、Docker socket 挂载或整个宿主 cgroup 的可写绑定启动工作环境。
 
 每个用户的数据根默认为 `~/.claude-cage`。容器引擎的数据固定在 `~/.claude-cage/container-engine/data`，与版本号和可执行文件目录分开。显式使用其他 `CLAUDE_CAGE_CONFIG` 时，须同步修改两个用户服务中的绝对配置路径和引擎数据根；后续升级继续使用同一组路径。
 
@@ -66,6 +66,8 @@ cage_engine="$HOME/.claude-cage/container-engine/tools/docker"
 ## 构建完整客体镜像
 
 先从同一份源码构建 Linux Cage 后端：`make cage GOOS=linux GOARCH=amd64 CGO_ENABLED=0`。构建会生成工作台资产及 `_output/bin/cage`；不运行发布或版本修改流程。
+
+Linux ARM64（aarch64）服务器可在本机原生构建：后端改用 `GOARCH=arm64`，并自备 rootless Docker 与 ARM64 的 Mihomo，`build-guest.sh` 接受 `aarch64`，基础镜像为同一固定 digest 的多平台清单。项目 CI 与桌面端一键部署只覆盖 amd64；ARM64 构建由社区实测（[#449](https://github.com/Lee-xeo/Claude-Cage/issues/449)），未纳入官方验证，产物不得与 amd64 的发行文件混用。
 
 通过 `Dockerfile.guest` 构建基础层，再创建独立的镜像构建容器。构建容器不挂载项目、个人主目录、代理配置或账户；安装下载使用单独的构建网络。默认 Debian 镜像已经固定 digest，APT 继续验证发行版签名。若部署网络需要镜像站，只调整构建阶段的 Debian 软件源，保留签名验证；基础层和完整镜像提交前均恢复 `deb.debian.org` 官方源，以符合运行环境的维护下载来源限制。
 

@@ -13,6 +13,7 @@ from pathlib import Path
 import queue
 import shutil
 import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -146,23 +147,27 @@ class CacheRegistry:
                 lease.close()
 
     def collect(self, selected, session):
+        remaining = False
         for record in self.records():
             root = Path(record['directory'])
             if root.exists() and record.get('pending') and not record['retired']:
                 try:
                     os.kill(record['producer'], 0)
+                    remaining = True
                     continue
                 except ProcessLookupError:
                     pass
             if root.exists() and not record.get('pending') and not record['retired'] and (not record['session'] or record['session'] == session):
                 continue
             if any(Path(path).is_relative_to(root) or root.is_relative_to(Path(path)) for path in selected):
+                remaining = True
                 continue
             lock_path = self.directory / (record['id'] + '.lock')
             with lock_path.open('rb') as lease:
                 try:
                     fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
+                    remaining = True
                     continue
                 if root.exists():
                     marker = root / record['marker']
@@ -184,6 +189,7 @@ class CacheRegistry:
                         raise
                 (self.directory / (record['id'] + '.json')).unlink()
             lock_path.unlink(missing_ok=True)
+        return remaining
 
 
 def file_paths(uris):
@@ -325,10 +331,68 @@ def pixel_signature(width, height, rowstride, channels, pixels):
     return digest.digest()
 
 
-def clipboard_worker(name, connection):
+def valid_desktop_instance(instance):
+    if not isinstance(instance, str) or len(instance) != 24 or any(c not in '0123456789abcdef' for c in instance):
+        raise ValueError('Invalid desktop instance')
+    return instance
+
+
+def desktop_display(instance, runtime_root=Path('/run')):
+    valid_desktop_instance(instance)
+    directory = runtime_root / ('desktop-' + instance)
+    display_file, authority = directory / 'display', directory / 'Xauthority'
+    if directory.is_symlink() or display_file.is_symlink() or authority.is_symlink():
+        raise ValueError('Invalid desktop runtime')
+    number = display_file.read_text().strip()
+    if not number.isascii() or not number.isdigit() or len(number) > 5 or not authority.is_file():
+        raise ValueError('Invalid desktop display')
+    return ':' + number, str(authority)
+
+
+def desktop_pid(instance):
+    valid_desktop_instance(instance)
+    result = subprocess.run(['systemctl', 'show', 'desktop-' + instance + '.service',
+                             '--property=MainPID', '--value'],
+                            check=True, capture_output=True, text=True, timeout=5)
+    pid = int(result.stdout.strip())
+    if pid <= 1:
+        raise ValueError('Desktop instance is not running')
+    return pid
+
+
+def enter_desktop_mount_namespace(instance):
+    pid = desktop_pid(instance)
+    descriptor = os.open('/proc/' + str(pid) + '/ns/mnt', os.O_RDONLY)
+    try:
+        os.setns(descriptor, 0)
+    finally:
+        os.close(descriptor)
+    # Re-evaluate /tmp after entering the service's PrivateTmp mount namespace.
+    tempfile.tempdir = None
+    return pid
+
+
+def bridge_desktop(instance):
+    display, authority = desktop_display(instance)
+    # Join the instance's PrivateTmp mount namespace in the parent so file
+    # imports, exports, and CacheRegistry receipts stay isolated per instance
+    # while remaining visible to the X11 worker and Claude Desktop.
+    pid = enter_desktop_mount_namespace(instance)
+    net_fd = os.open('/proc/' + str(pid) + '/ns/net', os.O_RDONLY)
+    try:
+        bridge(displays=((display, 'cage'),), authorities={display: authority},
+               namespace_fds=(net_fd,),
+               display_exists=lambda _name: Path('/proc/' + str(pid)).is_dir())
+    finally:
+        os.close(net_fd)
+
+
+def clipboard_worker(name, connection, authority=None):
     os.environ['NO_AT_BRIDGE'] = '1'
     os.environ['DISPLAY'] = name
-    if name == ':78':
+    if authority:
+        os.environ['XAUTHORITY'] = authority
+    elif name == ':78':
         os.environ['XAUTHORITY'] = '/run/cage-desktop/Xauthority'
     else:
         os.environ.pop('XAUTHORITY', None)
@@ -526,29 +590,40 @@ def clipboard_worker(name, connection):
                 connection.send({'ack': serial})
             except (TypeError, ValueError, KeyError, OSError, GLib.Error):
                 connection.send({'error': '剪贴板内容无法共享。'})
-        return True
+        return False
 
     def read():
         try:
             while True:
                 commands.put(connection.recv())
+                GLib.idle_add(tick)
         except EOFError:
             pass
         commands.put(None)
+        GLib.idle_add(tick)
     threading.Thread(target=read, daemon=True).start()
     clipboard.connect('owner-change', changed, name)
     changed(clipboard, None, name)
-    GLib.timeout_add(100, tick)
     Gtk.main()
 
 
-def bridge():
+def bridge_wait_timeout(worker_count, total_displays, cleanup_ready, cache_retry, next_cache_check, now):
+    if cleanup_ready:
+        return 0.0
+    timeout = 10.0 if worker_count >= total_displays else 1.0
+    if cache_retry:
+        timeout = min(timeout, max(0.0, next_cache_check - now))
+    return timeout
+
+
+def bridge(displays=((':77', 'cage-browser'), (':78', 'cage')), stdin_fd=None, stdout=None,
+           registry=None, spawn_worker=None, display_exists=None, materialize=materialize_guest_files,
+           authorities=None, namespace_fds=()):
     # GTK's providers use a default display. Keep one small worker per X11
     # session, under that application's UID, and merge only clipboard events.
     import multiprocessing
     import pwd
     import selectors
-    import uuid
     workers = {}
     commands = queue.Queue()
     pending = {}
@@ -557,11 +632,17 @@ def bridge():
     internal_serial = 0
     session = str(uuid.uuid4())
     announced = None
-    registry = CacheRegistry()
+    registry = registry or CacheRegistry()
     registry.begin_session(session)
+    stdin_fd = sys.stdin.fileno() if stdin_fd is None else stdin_fd
+    stdout = sys.stdout if stdout is None else stdout
+    display_exists = display_exists or (lambda name: Path('/tmp/.X11-unix/X' + name[1:]).exists())
     current_files = {}
-    next_cache_check = 0
+    next_cache_check = 0.0
     cleanup_needed = True
+    cache_retry = False
+    def emit(value):
+        print(json.dumps(value), file=stdout, flush=True)
     def referenced_files():
         selected = [path for paths in current_files.values() for path in paths]
         if last:
@@ -570,50 +651,85 @@ def bridge():
             selected.extend(value.get('files', []))
         return selected
     def run_worker(name, connection, uid, gid, home):
+        for descriptor in namespace_fds:
+            os.setns(descriptor, 0)
+            os.close(descriptor)
         os.initgroups(pwd.getpwuid(uid).pw_name, gid)
         os.setgid(gid)
         os.setuid(uid)
         os.environ['HOME'] = home
-        clipboard_worker(name, connection)
+        clipboard_worker(name, connection, (authorities or {}).get(name))
+    context = None if spawn_worker is not None else multiprocessing.get_context('fork')
+    if spawn_worker is None:
+        def spawn_worker(name, user):
+            account = pwd.getpwnam(user)
+            parent, child = context.Pipe()
+            process = context.Process(target=run_worker, args=(name, child, account.pw_uid, account.pw_gid, account.pw_dir))
+            process.start(); child.close()
+            return process, parent
     selector = selectors.DefaultSelector()
-    selector.register(sys.stdin.fileno(), selectors.EVENT_READ)
+    selector.register(stdin_fd, selectors.EVENT_READ, ('stdin', None))
     incoming = b''
-    context = multiprocessing.get_context('fork')
+    def remove_worker(name):
+        previous = workers.pop(name, None)
+        if not previous:
+            return
+        process, connection = previous
+        try:
+            selector.unregister(connection.fileno())
+        except (KeyError, ValueError, OSError):
+            pass
+        try:
+            connection.close()
+        except OSError:
+            pass
+        process.join(timeout=1)
+        current_files.pop(name, None)
+    def sync_workers():
+        nonlocal announced
+        for name, user in displays:
+            previous = workers.get(name)
+            if previous and (not previous[0].is_alive() or not display_exists(name)):
+                if previous[0].is_alive():
+                    previous[0].terminate()
+                remove_worker(name)
+            if name not in workers and display_exists(name):
+                process, parent = spawn_worker(name, user)
+                workers[name] = (process, parent)
+                selector.register(parent.fileno(), selectors.EVENT_READ, ('worker', name))
+                if initialized:
+                    parent.send(last)
+        available = bool(workers)
+        if available != announced:
+            emit({'hello': {'version': 1, 'os': 'linux', 'session': session,
+                  'formats': ['text', 'png', 'files'], 'available': available, 'file_release': True}})
+            announced = available
     try:
         running = True
         while running:
-            if selector.select(timeout=.05):
-                chunk = os.read(sys.stdin.fileno(), 65536)
-                if not chunk:
-                    break
-                incoming += chunk
-                if len(incoming) > WIRE_LIMIT:
-                    break
-                while b'\n' in incoming:
-                    line, incoming = incoming.split(b'\n', 1)
-                    try:
-                        commands.put(json.loads(line))
-                    except ValueError:
+            sync_workers()
+            cleanup_ready = cleanup_needed and bool(workers) and all(name in current_files for name in workers)
+            timeout = bridge_wait_timeout(len(workers), len(displays), cleanup_ready, cache_retry, next_cache_check, time.monotonic())
+            for key, _ in selector.select(timeout=timeout):
+                if key.data[0] == 'stdin':
+                    chunk = os.read(stdin_fd, 65536)
+                    if not chunk:
                         running = False
                         break
-            for name, user in ((':77', 'cage-browser'), (':78', 'cage')):
-                previous = workers.get(name)
-                if previous and not previous[0].is_alive():
-                    previous[0].join(); previous[1].close(); del workers[name]
-                    current_files.pop(name, None)
-                if name not in workers and Path('/tmp/.X11-unix/X' + name[1:]).exists():
-                    account = pwd.getpwnam(user)
-                    parent, child = context.Pipe()
-                    process = context.Process(target=run_worker, args=(name, child, account.pw_uid, account.pw_gid, account.pw_dir))
-                    process.start(); child.close()
-                    workers[name] = (process, parent)
-                    if initialized:
-                        parent.send(last)
-            available = bool(workers)
-            if available != announced:
-                print(json.dumps({'hello': {'version': 1, 'os': 'linux', 'session': session,
-                      'formats': ['text', 'png', 'files'], 'available': available, 'file_release': True}}), flush=True)
-                announced = available
+                    incoming += chunk
+                    if len(incoming) > WIRE_LIMIT:
+                        running = False
+                        break
+                    while b'\n' in incoming:
+                        line, incoming = incoming.split(b'\n', 1)
+                        try:
+                            commands.put(json.loads(line))
+                        except ValueError:
+                            running = False
+                            break
+            if not running:
+                break
+            sync_workers()
             while not commands.empty():
                 message = commands.get()
                 if message is None:
@@ -631,13 +747,14 @@ def bridge():
                 for _, connection in workers.values():
                     connection.send({**last, 'serial': serial})
                 if not pending[serial]['targets']:
-                    print(json.dumps({'ack': serial}), flush=True)
+                    emit({'ack': serial})
                     del pending[serial]
             for name, (process, connection) in list(workers.items()):
-                while process.is_alive() and connection.poll():
+                while connection.poll():
                     try:
                         message = connection.recv()
-                    except EOFError:
+                    except (EOFError, OSError):
+                        remove_worker(name)
                         break
                     if 'clipboard_files' in message:
                         current_files[name] = message['clipboard_files']
@@ -650,16 +767,16 @@ def bridge():
                             if not pending[serial]['targets']:
                                 outgoing = pending[serial]['message']
                                 if outgoing is None:
-                                    print(json.dumps({'ack': serial}), flush=True)
+                                    emit({'ack': serial})
                                 elif {key: value for key, value in outgoing.items() if key in ('text','png','files')} == last:
-                                    print(json.dumps(outgoing), flush=True)
+                                    emit(outgoing)
                                 else:
                                     registry.retire(outgoing.get('files', []))
                                     cleanup_needed = True
                                 del pending[serial]
                         continue
                     if message.get('error'):
-                        print(json.dumps(message), flush=True)
+                        emit(message)
                         continue
                     payload = {key: value for key, value in message.items() if key in ('text', 'png', 'files')}
                     if not initialized or payload == last:
@@ -667,10 +784,10 @@ def bridge():
                     if 'files' in payload:
                         try:
                             with registry.reading(payload['files']):
-                                payload = {'files': materialize_guest_files(payload['files'], 'cage-browser' if name == ':77' else 'cage', session)}
+                                payload = {'files': materialize(payload['files'], 'cage-browser' if name == ':77' else 'cage', session)}
                             message = {**payload, 'source': 'cage'}
                         except (ValueError, OSError, tarfile.TarError):
-                            print('{"error":"剪贴板文件无法共享，请检查文件是否仍存在及读取权限。"}', flush=True)
+                            emit({'error': '剪贴板文件无法共享，请检查文件是否仍存在及读取权限。'})
                             continue
                     last = payload
                     internal_serial -= 1
@@ -680,15 +797,16 @@ def bridge():
                         if other in targets:
                             sibling.send({**payload, 'serial': internal_serial})
                     if not targets:
-                        print(json.dumps(message), flush=True)
+                        emit(message)
                         del pending[internal_serial]
-            if workers and all(name in current_files for name in workers) and (cleanup_needed or time.monotonic() >= next_cache_check):
+            if workers and all(name in current_files for name in workers) and (cleanup_needed or (cache_retry and time.monotonic() >= next_cache_check)):
                 try:
-                    registry.collect(referenced_files(), session)
+                    cache_retry = registry.collect(referenced_files(), session)
                 except (ValueError, OSError):
                     print('Clipboard cache cleanup failed; creation records retained.', file=sys.stderr)
+                    cache_retry = True
                 cleanup_needed = False
-                next_cache_check = time.monotonic() + 1
+                next_cache_check = time.monotonic() + 1.0
     finally:
         try:
             registry.end_session(session)
@@ -707,25 +825,63 @@ def bridge():
                 process.kill(); process.join()
 
 
-if __name__ == '__main__':
-    if sys.argv[1:] == ['--import'] or len(sys.argv) == 4 and sys.argv[1:3] == ['--import', '--session']:
-        print(json.dumps({'paths': import_files(sys.stdin.buffer, sys.argv[3] if len(sys.argv) == 4 else '')}))
-    elif len(sys.argv) == 4 and sys.argv[1] == '--export-user' and sys.argv[2] in ('cage', 'cage-browser') and sys.argv[3] == '--paths-stdin':
+def main(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args:
+        bridge()
+        return
+    if len(args) == 2 and args[0] == '--desktop':
+        bridge_desktop(args[1])
+        return
+    if args[0] == '--import':
+        session = ''
+        desktop = ''
+        index = 1
+        while index < len(args):
+            flag = args[index]
+            if flag == '--session' and index + 1 < len(args) and not session:
+                session = args[index + 1]
+                index += 2
+            elif flag == '--desktop' and index + 1 < len(args) and not desktop:
+                desktop = args[index + 1]
+                index += 2
+            else:
+                raise ValueError('Invalid clipboard import arguments')
+        if desktop:
+            enter_desktop_mount_namespace(desktop)
+        print(json.dumps({'paths': import_files(sys.stdin.buffer, session)}))
+        return
+    if len(args) in (3, 5) and args[0] == '--export-user' and args[1] in ('cage', 'cage-browser') and args[2] == '--paths-stdin':
+        desktop = ''
+        if len(args) == 5:
+            if args[3] != '--desktop':
+                raise ValueError('Invalid clipboard export arguments')
+            desktop = args[4]
         import pwd
+        if desktop:
+            enter_desktop_mount_namespace(desktop)
         selection = sys.stdin.buffer.read((1 << 20) + 1)
         if len(selection) > 1 << 20:
             raise ValueError('file selection exceeded its limit')
         paths = json.loads(selection)
         with CacheRegistry().reading(paths):
-            account = pwd.getpwnam(sys.argv[2])
+            # Keep this spelling: the guest profile rewrites it to map the
+            # stable role name to the environment's own user name.
+            user = args[1]
+            account = pwd.getpwnam(user)
             os.initgroups(account.pw_name, account.pw_gid)
             os.setgid(account.pw_gid)
             os.setuid(account.pw_uid)
             export_files(paths, sys.stdout.buffer)
-    elif len(sys.argv) == 3 and sys.argv[1] == '--export':
-        selection = sys.stdin.buffer.read((1 << 20) + 1) if sys.argv[2] == '--paths-stdin' else sys.argv[2]
+        return
+    if len(args) == 2 and args[0] == '--export':
+        selection = sys.stdin.buffer.read((1 << 20) + 1) if args[1] == '--paths-stdin' else args[1]
         if len(selection) > 1 << 20:
             raise ValueError('file selection exceeded its limit')
         export_files(json.loads(selection), sys.stdout.buffer)
-    else:
-        bridge()
+        return
+    raise ValueError('Invalid clipboard arguments')
+
+
+if __name__ == '__main__':
+    main()

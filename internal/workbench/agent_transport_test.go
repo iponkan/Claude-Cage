@@ -254,10 +254,11 @@ func TestAgentSocketUsesTheSameTerminalAndAccountLock(t *testing.T) {
 	}
 	cancel()
 	writer.Close()
-	output.Close()
+	go func() { _, _ = io.Copy(io.Discard, output) }()
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
+	output.Close()
 	s.account.lock()
 	if err := AgentSocket(context.Background(), s.configPath, AgentTarget{}, "/api/terminals/"+session.id+"/stream", io.NopCloser(strings.NewReader("")), io.Discard); err == nil {
 		t.Fatal("locked account retained terminal access")
@@ -288,5 +289,68 @@ func TestAgentSocketRejectsMalformedInputWithoutWaitingForRemote(t *testing.T) {
 	var ae *AgentError
 	if !errors.As(err, &ae) || ae.Code != "invalid_input" || time.Since(started) > time.Second {
 		t.Fatal("malformed input hung or was reported as success", err)
+	}
+}
+
+func TestAgentNativeLongPollWakesOnSubmissionAndClose(t *testing.T) {
+	s := agentTestController(t)
+	ticket := s.issueTicket()
+	registered := request(s, "POST", "/api/agent/native/window", s.origin, `{"ticket":"`+ticket+`"}`, true)
+	var grant struct {
+		Proof string `json:"window_proof"`
+	}
+	if err := json.Unmarshal(registered.Body.Bytes(), &grant); err != nil || grant.Proof == "" {
+		t.Fatal("window proof failed", registered.Code, registered.Body.String())
+	}
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		r := httptest.NewRequest("GET", s.origin+"/api/agent/native?consumer=window&wait=5", nil)
+		r.Header.Set(connectionHeader, "local")
+		r.Header.Set("X-Cage-Agent-Window", grant.Proof)
+		r.AddCookie(&http.Cookie{Name: s.cookieName(), Value: s.session})
+		w := httptest.NewRecorder()
+		s.handler().ServeHTTP(w, r)
+		done <- w
+	}()
+	time.Sleep(40 * time.Millisecond)
+	select {
+	case w := <-done:
+		t.Fatalf("long poll returned early without work: %d %s", w.Code, w.Body.String())
+	default:
+	}
+	data, err := AgentCall(context.Background(), s.configPath, "native.submit", json.RawMessage(`{"connection_id":"local","request":{"action":"clipboardRead"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var item agentNativeItem
+	_ = json.Unmarshal(data, &item)
+	select {
+	case w := <-done:
+		if w.Code != 200 || !strings.Contains(w.Body.String(), item.ID) {
+			t.Fatalf("long poll did not claim submitted item: %d %s", w.Code, w.Body.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("long poll did not wake up after submission")
+	}
+	// Closing the server unblocks waiting consumers immediately.
+	closing := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		r := httptest.NewRequest("GET", s.origin+"/api/agent/native?consumer=window&wait=10", nil)
+		r.Header.Set(connectionHeader, "local")
+		r.Header.Set("X-Cage-Agent-Window", grant.Proof)
+		r.AddCookie(&http.Cookie{Name: s.cookieName(), Value: s.session})
+		w := httptest.NewRecorder()
+		s.handler().ServeHTTP(w, r)
+		closing <- w
+	}()
+	time.Sleep(40 * time.Millisecond)
+	s.beginClose()
+	select {
+	case w := <-closing:
+		if w.Code != 200 || strings.TrimSpace(w.Body.String()) != "{}" {
+			t.Fatalf("unexpected close response: %d %s", w.Code, w.Body.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("long poll did not unblock on server close")
 	}
 }

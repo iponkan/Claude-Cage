@@ -21,7 +21,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/sylvinus/agent-vm/internal/cage"
 	"github.com/sylvinus/agent-vm/internal/clipboardfiles"
-	"github.com/sylvinus/agent-vm/internal/guestos"
 	"github.com/sylvinus/agent-vm/internal/transfermeta"
 )
 
@@ -70,40 +69,6 @@ type clipboardHello struct {
 // The profile chooses the transport. A guest file selection can never choose
 // an executable, account, remote command or host path.
 func (s *Server) clipboardCommand(ctx context.Context, operation string, selection clipboardFileSelection) (*exec.Cmd, string, error) {
-	win, err := guestos.LoadWindowsProfile(s.profile)
-	if err != nil {
-		return nil, "", err
-	}
-	if win != nil {
-		if s.macosGuest != nil {
-			return nil, "", errors.New("客机绑定冲突")
-		}
-		args := []string{}
-		if operation == "export" {
-			args = append(args, "--paths-stdin")
-		}
-		cmd, err := guestos.WindowsRelayCommand(ctx, s.profile, operation, args...)
-		if err == nil && operation == "export" {
-			data, _ := json.Marshal(selection.Paths)
-			cmd.Stdin = bytes.NewReader(data)
-		}
-		return cmd, "guest", err
-	}
-	if s.macosGuest != nil {
-		if operation != "stream" && operation != "import" && operation != "export" && operation != "upload" && operation != "request" {
-			return nil, "", errors.New("剪贴板操作无效")
-		}
-		if operation == "export" && selection.User != "guest" {
-			return nil, "", errors.New("剪贴板文件来源无效")
-		}
-		command := "exec '/Applications/Cage Guest Clipboard.app/Contents/MacOS/CageGuestClipboard' --client " + operation
-		cmd := s.sshCommand(ctx, "-T", s.sshTarget(), "--", command)
-		if operation == "export" {
-			data, _ := json.Marshal(selection.Paths)
-			cmd.Stdin = bytes.NewReader(data)
-		}
-		return cmd, "guest", nil
-	}
 	helper, err := s.linuxTemplate(cage.SharedClipboardHelper)
 	if err != nil {
 		return nil, "", err
@@ -114,16 +79,39 @@ func (s *Server) clipboardCommand(ctx context.Context, operation string, selecti
 	}
 	switch operation {
 	case "stream":
+		if selection.DesktopID != "" {
+			if !validClaudeID(selection.DesktopID) {
+				return nil, "", errors.New("Desktop 标识无效")
+			}
+			command += " --desktop " + shellescape.Quote(selection.DesktopID)
+		}
 	case "import":
-		s.mu.Lock()
-		session := s.clipboardGuestSession
-		s.mu.Unlock()
+		session := selection.Session
+		desktopID := selection.DesktopID
+		if session == "" && desktopID == "" {
+			s.mu.Lock()
+			session = s.clipboardGuestSession
+			desktopID = s.clipboardDesktop
+			s.mu.Unlock()
+		}
 		command += " --import --session " + shellescape.Quote(session)
+		if desktopID != "" {
+			if !validClaudeID(desktopID) {
+				return nil, "", errors.New("Desktop 标识无效")
+			}
+			command += " --desktop " + shellescape.Quote(desktopID)
+		}
 	case "export":
 		if selection.User != "cage" && selection.User != "cage-browser" {
 			return nil, "", errors.New("剪贴板文件来源无效")
 		}
 		command += " --export-user " + selection.User + " --paths-stdin"
+		if selection.DesktopID != "" {
+			if !validClaudeID(selection.DesktopID) {
+				return nil, "", errors.New("Desktop 标识无效")
+			}
+			command += " --desktop " + shellescape.Quote(selection.DesktopID)
+		}
 	default:
 		return nil, "", errors.New("剪贴板操作无效")
 	}
@@ -136,9 +124,11 @@ func (s *Server) clipboardCommand(ctx context.Context, operation string, selecti
 }
 
 type clipboardFileSelection struct {
-	Paths []string
-	User  string
-	lease *clipboardFileLease
+	DesktopID string
+	Session   string
+	Paths     []string
+	User      string
+	lease     *clipboardFileLease
 }
 
 type clipboardFileLease struct {
@@ -147,13 +137,17 @@ type clipboardFileLease struct {
 	release func()
 }
 
-func (s *Server) registerClipboardFiles(paths []string, user string) string {
+func (s *Server) registerClipboardFiles(paths []string, user string, desktopID ...string) string {
+	desktop := ""
+	if len(desktopID) > 0 {
+		desktop = desktopID[0]
+	}
 	s.mu.Lock()
 	if s.clipboardFiles == nil {
 		s.clipboardFiles = map[string]clipboardFileSelection{}
 	}
 	for id, previous := range s.clipboardFiles {
-		if previous.User == user && slices.Equal(previous.Paths, paths) {
+		if previous.User == user && previous.DesktopID == desktop && slices.Equal(previous.Paths, paths) {
 			s.mu.Unlock()
 			return id
 		}
@@ -169,7 +163,7 @@ func (s *Server) registerClipboardFiles(paths []string, user string) string {
 	if release := s.clipboardRelease; release != nil {
 		lease.release = func() { release(ownedPaths) }
 	}
-	s.clipboardFiles[id] = clipboardFileSelection{Paths: ownedPaths, User: user, lease: lease}
+	s.clipboardFiles[id] = clipboardFileSelection{DesktopID: desktop, Paths: ownedPaths, User: user, lease: lease}
 	s.mu.Unlock()
 	for _, release := range releases {
 		release()
@@ -248,22 +242,73 @@ func (s *Server) clipboardFileSelection(id string) clipboardFileSelection {
 	return selection
 }
 
-func (s *Server) sharedClipboard(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	available := s.ready && !s.closing && s.clipboardCancel == nil
-	ctx, cancel := context.WithCancel(r.Context())
-	if available {
-		s.clipboardCancel = cancel
+func (s *Server) acquireClipboardSlot(parent context.Context, desktopID string) (context.Context, context.CancelFunc, func(), bool) {
+	for {
+		s.mu.Lock()
+		if !s.ready || s.closing {
+			s.mu.Unlock()
+			return nil, nil, nil, false
+		}
+		if s.clipboardCancel == nil {
+			ctx, cancel := context.WithCancel(parent)
+			done := make(chan struct{})
+			s.clipboardCancel = cancel
+			s.clipboardDone = done
+			s.clipboardDesktop = desktopID
+			s.mu.Unlock()
+			release := func() {
+				cancel()
+				s.mu.Lock()
+				if s.clipboardDone == done {
+					s.clipboardCancel = nil
+					s.clipboardDone = nil
+					s.clipboardDesktop = ""
+					s.clipboardRelease = nil
+				}
+				s.mu.Unlock()
+				close(done)
+			}
+			return ctx, cancel, release, true
+		}
+		// Switching between the default workbench clipboard and an isolated
+		// Desktop instance supersedes the outgoing connection without a 409
+		// reconnect delay. Duplicate connections to the same target still fail.
+		if s.clipboardDesktop == desktopID {
+			s.mu.Unlock()
+			return nil, nil, nil, false
+		}
+		prevCancel, prevDone := s.clipboardCancel, s.clipboardDone
+		s.mu.Unlock()
+		prevCancel()
+		if prevDone == nil {
+			return nil, nil, nil, false
+		}
+		timer := time.NewTimer(2 * time.Second)
+		select {
+		case <-prevDone:
+			timer.Stop()
+		case <-parent.Done():
+			timer.Stop()
+			return nil, nil, nil, false
+		case <-timer.C:
+			return nil, nil, nil, false
+		}
 	}
-	s.mu.Unlock()
+}
+
+func (s *Server) sharedClipboard(w http.ResponseWriter, r *http.Request) {
+	s.sharedDesktopClipboard(w, r, "")
+}
+
+func (s *Server) sharedDesktopClipboard(w http.ResponseWriter, r *http.Request, desktopID string) {
+	ctx, cancel, releaseSlot, available := s.acquireClipboardSlot(r.Context(), desktopID)
 	if !available {
-		cancel()
 		http.Error(w, "剪贴板连接暂不可用", http.StatusConflict)
 		return
 	}
-	defer func() { cancel(); s.mu.Lock(); s.clipboardCancel = nil; s.clipboardRelease = nil; s.mu.Unlock() }()
+	defer releaseSlot()
 	// 以当前后端配套的辅助脚本启动连接，保留 stdin/stdout 传输剪贴板数据。
-	cmd, source, err := s.clipboardCommand(ctx, "stream", clipboardFileSelection{})
+	cmd, source, err := s.clipboardCommand(ctx, "stream", clipboardFileSelection{DesktopID: desktopID})
 	if err != nil {
 		http.Error(w, "剪贴板客机配置无效", 502)
 		return
@@ -316,9 +361,6 @@ func (s *Server) sharedClipboard(w http.ResponseWriter, r *http.Request) {
 				expectedOS := "linux"
 				if source == "guest" {
 					expectedOS = "windows"
-					if s.macosGuest != nil {
-						expectedOS = "darwin"
-					}
 				}
 				if hello.Version != 1 || hello.OS != expectedOS || len(hello.Session) == 0 || len(hello.Session) > 256 {
 					return
@@ -346,7 +388,7 @@ func (s *Server) sharedClipboard(w http.ResponseWriter, r *http.Request) {
 				if payload.Source != source && !(source == "cage" && payload.Source == "cage-browser") {
 					return
 				}
-				payload.Files, _ = json.Marshal(s.registerClipboardFiles(paths, payload.Source))
+				payload.Files, _ = json.Marshal(s.registerClipboardFiles(paths, payload.Source, desktopID))
 				payload.Source = ""
 			}
 			_ = ws.SetWriteDeadline(time.Now().Add(15 * time.Second))
@@ -376,11 +418,11 @@ func (s *Server) sharedClipboard(w http.ResponseWriter, r *http.Request) {
 			if json.Unmarshal(payload.Files, &id) != nil {
 				return
 			}
-			paths := s.clipboardFileSelection(id).Paths
-			if len(paths) == 0 {
+			selection := s.clipboardFileSelection(id)
+			if len(selection.Paths) == 0 || selection.DesktopID != desktopID {
 				return
 			}
-			payload.Files, _ = json.Marshal(paths)
+			payload.Files, _ = json.Marshal(selection.Paths)
 		}
 		if writeGuest(payload) != nil {
 			return
@@ -444,7 +486,10 @@ func (s *Server) clipboardArchive(w http.ResponseWriter, r *http.Request) {
 	if prepared.Unclean {
 		w.Header().Set("X-Cage-Metadata-Warning", "metadata-may-remain")
 	}
-	cmd, source, err := s.clipboardCommand(ctx, "import", clipboardFileSelection{})
+	s.mu.Lock()
+	session, desktopID := s.clipboardGuestSession, s.clipboardDesktop
+	s.mu.Unlock()
+	cmd, source, err := s.clipboardCommand(ctx, "import", clipboardFileSelection{Session: session, DesktopID: desktopID})
 	if err != nil {
 		http.Error(w, "传递剪贴板文件失败", 502)
 		return
@@ -465,59 +510,7 @@ func (s *Server) clipboardArchive(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "传递剪贴板文件失败，请核对文件大小和名称", 502)
 		return
 	}
-	jsonReply(w, map[string]string{"files": s.registerClipboardFiles(result.Paths, source)})
-}
-
-// clipboardCopy reads only the new text produced by an explicit web copy.
-// The UI sends the keys on its existing window input queue between both phases.
-func (s *Server) clipboardCopy(w http.ResponseWriter, r *http.Request) {
-	if s.macosGuest == nil {
-		http.NotFound(w, r)
-		return
-	}
-	var request struct {
-		Phase    string `json:"phase"`
-		Session  string `json:"session"`
-		Revision *int   `json:"revision"`
-	}
-	if !readJSON(w, r, &request) {
-		return
-	}
-	if request.Phase != "prepare" && request.Phase != "read" ||
-		request.Phase == "read" && (request.Revision == nil || *request.Revision < 0 || len(request.Session) == 0 || len(request.Session) > 256) {
-		http.Error(w, "剪贴板复制请求无效", http.StatusBadRequest)
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
-	defer cancel()
-	cmd, _, err := s.clipboardCommand(ctx, "request", clipboardFileSelection{})
-	if err != nil {
-		http.Error(w, "无法连接客机剪贴板", http.StatusBadGateway)
-		return
-	}
-	body, _ := json.Marshal(map[string]any{"operation": "copy-" + request.Phase, "revision": request.Revision, "session": request.Session})
-	cmd.Stdin = bytes.NewReader(append(body, '\n'))
-	out, err := cmd.StdoutPipe()
-	if err != nil || cmd.Start() != nil {
-		http.Error(w, "无法连接客机剪贴板", http.StatusBadGateway)
-		return
-	}
-	data, readErr := io.ReadAll(io.LimitReader(out, clipboardWireLimit+1))
-	out.Close()
-	finished := cmd.Wait()
-	var result struct {
-		Text     *string `json:"text,omitempty"`
-		Session  string  `json:"session"`
-		Revision int     `json:"revision"`
-		Error    string  `json:"error,omitempty"`
-	}
-	if readErr != nil || finished != nil || len(data) > clipboardWireLimit || json.Unmarshal(data, &result) != nil || result.Error != "" ||
-		len(result.Session) == 0 || request.Phase == "read" && (result.Text == nil || len(*result.Text) > 2<<20 || result.Session != request.Session || result.Revision == *request.Revision) {
-		http.Error(w, "未收到新的选中文本，请确认客机已解锁并重新复制", http.StatusConflict)
-		return
-	}
-	w.Header().Set("Cache-Control", "no-store")
-	jsonReply(w, result)
+	jsonReply(w, map[string]string{"files": s.registerClipboardFiles(result.Paths, source, desktopID)})
 }
 
 func writeClipboardArchive(output io.Writer, paths []string, options ...transfermeta.Options) error {

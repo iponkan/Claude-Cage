@@ -1,6 +1,7 @@
 package agentcli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sylvinus/agent-vm/internal/cage"
+	"github.com/sylvinus/agent-vm/internal/containerenv"
 	"github.com/sylvinus/agent-vm/internal/guestos"
 	"github.com/sylvinus/agent-vm/internal/host"
 	"github.com/sylvinus/agent-vm/internal/version"
@@ -52,7 +54,7 @@ func runAgent(args []string, stdin io.Reader, stdout io.Writer, clientOnly bool)
 			if reply.Error.Code == "invalid_input" || reply.Error.Code == "unknown_operation" {
 				code = 2
 			}
-			if reply.Error.Code == "account_locked" || reply.Error.Code == "user_action_required" {
+			if reply.Error.Code == "account_locked" || reply.Error.Code == "account_missing" || reply.Error.Code == "user_action_required" {
 				code = 3
 			}
 			if reply.Error.Code == "wait_timeout" {
@@ -143,7 +145,7 @@ func runAgent(args []string, stdin io.Reader, stdout io.Writer, clientOnly bool)
 		response, err := workbench.AgentRequest(ctx, path, workbench.AgentTarget{Scope: *scope, Connection: *connection}, "GET", "/api/agent/routes", nil, "", "")
 		return finish(response.Data, err)
 	case "help", "--help", "capabilities":
-		return finish(map[string]any{"platform": runtime.GOOS, "arch": runtime.GOARCH, "commands": []string{"capabilities", "doctor", "init", "service.start", "host.inspect", "call NAME", "request METHOD /api/PATH", "socket /api/PATH", "routes", "job ID", "diagnostics"}, "operations": workbench.AgentOperations(), "routes": "agent routes reads the actual registered routes from the chosen live listener", "exit_codes": map[string]int{"completed_or_accepted": 0, "operation_failed": 1, "invalid_input": 2, "user_action_required": 3, "wait_timeout": 4}, "guide": "https://claude-cage.com/docs/agent/", "scope": "local: owning workload; desktop: client configuration; selected: explicit desktop connection generation; client: lightweight client listener", "request": map[string]any{"methods": []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}, "path": "relative /api/ endpoint from the UI", "binary": "--input FILE --content-type application/octet-stream; --output ABSOLUTE_NEW_FILE", "native": "call native.submit --scope desktop; request GET /api/agent/native/ID --scope desktop; use the same native action and connection_id as the open window"}, "job_retention": "only the latest job; query promptly and never resubmit an unknown mutation automatically"}, nil)
+		return finish(map[string]any{"platform": runtime.GOOS, "arch": runtime.GOARCH, "commands": []string{"capabilities", "doctor", "init", "service.start", "host.inspect", "call NAME", "request METHOD /api/PATH", "socket /api/PATH", "routes", "job ID", "diagnostics"}, "operations": workbench.AgentOperations(), "routes": "agent routes reads the actual registered routes from the chosen live listener", "exit_codes": map[string]int{"completed_or_accepted": 0, "operation_failed": 1, "invalid_input": 2, "user_action_required": 3, "wait_timeout": 4}, "guide": "https://claude-cage.com/docs/agent/", "scope": "local: owning workload; desktop: client configuration; selected: explicit desktop connection generation; client: lightweight client listener", "request": map[string]any{"methods": []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}, "path": "relative /api/ endpoint from the UI", "binary": "--input FILE --content-type application/octet-stream; --output ABSOLUTE_NEW_FILE", "native": "call native.submit --scope desktop; request GET /api/agent/native/ID --scope desktop; use the same native action and connection_id as the open window"}, "job_retention": "the latest job and the job it replaced (initiator records agent/desktop/setup; canceled_by and superseded_by name the cancellation source and replacement job when a running job is canceled or replaced by a stop); query promptly and never resubmit an unknown mutation automatically"}, nil)
 	case "init":
 		if _, err := os.Stat(path); err == nil {
 			if _, err := cage.Load(path); err != nil {
@@ -156,16 +158,9 @@ func runAgent(args []string, stdin io.Reader, stdout io.Writer, clientOnly bool)
 		if err := host.EnsurePrivateDir(filepath.Dir(path)); err != nil {
 			return finish(nil, err)
 		}
-		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-		if err != nil {
-			return finish(nil, err)
-		}
-		err = host.ProtectFile(path)
+		data, err := json.Marshal(cage.DefaultConfig())
 		if err == nil {
-			err = json.NewEncoder(file).Encode(cage.DefaultConfig())
-		}
-		if e := file.Close(); err == nil {
-			err = e
+			err = host.CreatePrivateFile(path, append(data, '\n'))
 		}
 		return finish(map[string]bool{"created": err == nil}, err)
 	case "service.start":
@@ -194,7 +189,7 @@ func runAgent(args []string, stdin io.Reader, stdout io.Writer, clientOnly bool)
 			response, err := workbench.AgentRequest(ctx, path, workbench.AgentTarget{Scope: *scope, Connection: *connection}, "GET", endpoint, nil, "", "")
 			return finish(map[string]any{"scope": *scope, "snapshot": response.Data, "note": "Read-only snapshot of the explicit target. No repairs were applied."}, err)
 		}
-		return finish(agentDoctor(ctx, path), nil)
+		return finish(agentDoctor(ctx, path, clientOnly), nil)
 	case "diagnostics":
 		if !filepath.IsAbs(*output) {
 			return bad("diagnostics requires --output with an absolute local ZIP path.")
@@ -258,6 +253,12 @@ func runAgent(args []string, stdin io.Reader, stdout io.Writer, clientOnly bool)
 		var data json.RawMessage
 		if command == "call" {
 			body := []byte("{}")
+			// Input is read only with --input. Data already waiting on stdin
+			// means the caller expected it to be read; do not run the
+			// operation as if no fields had been given.
+			if f, ok := stdin.(*os.File); ok && *input == "" && pendingInput(f) {
+				return bad("Standard input has data, but call reads input only with --input - or --input FILE. Repeat the call with --input -.")
+			}
 			if *input != "" {
 				reader := stdin
 				if *input != "-" {
@@ -268,10 +269,12 @@ func runAgent(args []string, stdin io.Reader, stdout io.Writer, clientOnly bool)
 					defer f.Close()
 					reader = f
 				}
-				body, err = io.ReadAll(io.LimitReader(reader, (12<<20)+1))
+				body, err = io.ReadAll(io.LimitReader(reader, (12<<20)+4))
 				if err != nil {
 					return finish(nil, err)
 				}
+				// Windows PowerShell 5.1 writes a UTF-8 BOM by default (Set-Content -Encoding UTF8).
+				body = bytes.TrimPrefix(body, []byte{0xEF, 0xBB, 0xBF})
 			}
 			var object map[string]json.RawMessage
 			if len(body) > 12<<20 || json.Unmarshal(body, &object) != nil || object == nil {
@@ -321,7 +324,11 @@ func runAgent(args []string, stdin io.Reader, stdout io.Writer, clientOnly bool)
 			return finish(data, nil)
 		}
 		if job.Canceled {
-			return finish(data, &workbench.AgentError{Code: "job_canceled", Message: "The original job was canceled. Inspect status before retrying.", NextAction: "status"})
+			message := "The original job was canceled. Inspect status before retrying."
+			if job.CanceledBy != "" {
+				message = "The original job was canceled by " + job.CanceledBy + ". Inspect status before retrying."
+			}
+			return finish(data, &workbench.AgentError{Code: "job_canceled", Message: message, NextAction: "status"})
 		}
 		if job.Error != "" {
 			return finish(data, &workbench.AgentError{Code: "job_failed", Message: job.Error, NextAction: "doctor"})
@@ -367,7 +374,46 @@ func agentWaitTarget(parent context.Context, path string, target workbench.Agent
 	}
 }
 
-func agentDoctor(ctx context.Context, path string) map[string]any {
+// environmentCheck reads status. A ready environment whose gate is closed
+// refuses guest connections, so it is not reported as ready (#761).
+func environmentCheck(state json.RawMessage) (code, status, next string) {
+	var view struct {
+		Ready         bool          `json:"ready"`
+		Running       bool          `json:"vm_running"`
+		Update        bool          `json:"environment_update_required"`
+		Job           workbench.Job `json:"job"`
+		NetworkError  string        `json:"network_error"`
+		NetworkPaused bool          `json:"network_paused"`
+		NetworkOpen   *bool         `json:"network_open"`
+		Safety        struct {
+			Gate *struct {
+				Mode string `json:"mode"`
+			} `json:"gate"`
+		} `json:"safety"`
+	}
+	_ = json.Unmarshal(state, &view)
+	switch {
+	case view.Job.Running:
+		return "job_running", "waiting", "job " + view.Job.ID
+	case view.Job.Error != "":
+		return "job_failed", "blocked", "diagnostics"
+	case view.Update:
+		return "environment_update_required", "blocked", "environment.update"
+	case !view.Running || !view.Ready:
+		return "environment_not_ready", "blocked", "environment.start"
+	case view.NetworkError != "":
+		return "network_not_ready", "blocked", "inspect_network_policy"
+	case view.NetworkPaused:
+		return "network_paused", "blocked", "network.check"
+	case view.Safety.Gate != nil && view.Safety.Gate.Mode == cage.GateChecking:
+		return "network_checking", "waiting", "status"
+	case view.NetworkOpen != nil && !*view.NetworkOpen:
+		return "network_closed", "blocked", "network.check"
+	}
+	return "environment_ready", "ok", ""
+}
+
+func agentDoctor(ctx context.Context, path string, clientOnly bool) map[string]any {
 	result := map[string]any{"note": "Read-only snapshot. No repairs were applied; missing services were not started."}
 	checks := []map[string]any{}
 	add := func(code, status, next string) {
@@ -380,8 +426,19 @@ func agentDoctor(ctx context.Context, path string) map[string]any {
 	} else {
 		add("config_valid", "ok", "")
 	}
+	profile := filepath.Dir(path)
+	if !clientOnly && !containerenv.Configured(profile) {
+		switch err := cage.ValidateProfileLimaSocketPaths(profile); {
+		case errors.Is(err, cage.ErrLimaSocketPathTooLong):
+			checks = append(checks, map[string]any{"code": "lima_socket_path_too_long", "status": "blocked", "next_action": "use_shorter_local_config_or_storage_path", "message": err.Error()})
+		case err != nil:
+			checks = append(checks, map[string]any{"code": "lima_home_unavailable", "status": "blocked", "next_action": "diagnostics", "message": err.Error()})
+		default:
+			add("lima_socket_path", "ok", "")
+		}
+	}
 	for _, name := range []string{"account.json", "proxy/sources.json"} {
-		if err := host.CheckPrivateFile(filepath.Join(filepath.Dir(path), filepath.FromSlash(name))); err != nil && !os.IsNotExist(err) {
+		if err := host.CheckPrivateFile(filepath.Join(profile, filepath.FromSlash(name))); err != nil && !os.IsNotExist(err) {
 			add("private_file_permissions", "blocked", "repair_profile_permissions")
 		}
 	}
@@ -408,11 +465,16 @@ func agentDoctor(ctx context.Context, path string) map[string]any {
 			if proxy, e := workbench.AgentCall(ctx, path, "proxy.status", nil); e == nil {
 				result["proxy"] = proxy
 				var view struct {
-					Active  bool  `json:"active"`
-					Running bool  `json:"running"`
-					Sources []any `json:"sources"`
+					Active        bool  `json:"active"`
+					Running       bool  `json:"running"`
+					CoreAvailable *bool `json:"core_available"`
+					Sources       []any `json:"sources"`
 				}
 				_ = json.Unmarshal(proxy, &view)
+				if view.CoreAvailable != nil && !*view.CoreAvailable {
+					// proxy.core_error names the expected location.
+					add("proxy_core_missing", "blocked", "reinstall")
+				}
 				switch {
 				case len(view.Sources) == 0:
 					add("proxy_missing", "blocked", "proxy.import")
@@ -428,28 +490,7 @@ func agentDoctor(ctx context.Context, path string) map[string]any {
 			}
 			if state, e := workbench.AgentCall(ctx, path, "status", nil); e == nil {
 				result["environment"] = state
-				var view struct {
-					Ready        bool          `json:"ready"`
-					Running      bool          `json:"vm_running"`
-					Update       bool          `json:"environment_update_required"`
-					Job          workbench.Job `json:"job"`
-					NetworkError string        `json:"network_error"`
-				}
-				_ = json.Unmarshal(state, &view)
-				switch {
-				case view.Job.Running:
-					add("job_running", "waiting", "job "+view.Job.ID)
-				case view.Job.Error != "":
-					add("job_failed", "blocked", "diagnostics")
-				case view.Update:
-					add("environment_update_required", "blocked", "environment.update")
-				case !view.Running || !view.Ready:
-					add("environment_not_ready", "blocked", "environment.start")
-				case view.NetworkError != "":
-					add("network_not_ready", "blocked", "inspect_network_policy")
-				default:
-					add("environment_ready", "ok", "")
-				}
+				add(environmentCheck(state))
 			} else {
 				add("environment_status_unavailable", "blocked", "diagnostics")
 			}

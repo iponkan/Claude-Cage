@@ -10,6 +10,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,12 +21,12 @@ import (
 	"github.com/sylvinus/agent-vm/internal/cli"
 	"github.com/sylvinus/agent-vm/internal/containerenv"
 	"github.com/sylvinus/agent-vm/internal/diagnostics"
-	"github.com/sylvinus/agent-vm/internal/guestos"
 	"github.com/sylvinus/agent-vm/internal/guestprofile"
 	"github.com/sylvinus/agent-vm/internal/host"
 	"github.com/sylvinus/agent-vm/internal/hostproxy"
 	"github.com/sylvinus/agent-vm/internal/limaembed"
 	"github.com/sylvinus/agent-vm/internal/managedproxy"
+	"github.com/sylvinus/agent-vm/internal/uilocale"
 	"github.com/sylvinus/agent-vm/internal/workbench"
 	"io"
 	"os/signal"
@@ -43,15 +45,21 @@ cage container-configure --json  Configure a Linux container from JSON stdin
 cage init          Create a private profile; add and select nodes in Cage settings
 cage check         Verify proxy transport (no VM required)
 cage guest-os --json  Check host prerequisites for a same-system guest
-                     On Windows, add --vm-id GUID to inspect one Hyper-V VM
 cage proxy-start   Start Cage's bundled proxy core with the applied node
 cage proxy-stop    Stop Cage's core and close external networking
 cage setup         Build the isolated base VM through the specified proxy
 cage up            Start the shared Cage environment, editor and browser
+                   --reset re-clones the VM; files and logins on its disk are lost
 cage login         Start cage services, then Claude's login flow inside the VM
+                   --reset re-clones the VM; files and logins on its disk are lost
 cage access        Inspect legacy viewer credentials (diagnostics only)
 cage shell         Open a shell in the shared environment
-cage run COMMAND   Execute a command in the shared environment
+cage run COMMAND   Execute a command in the shared environment: from the current
+                   directory's place when it is in a shared project, otherwise
+                   from the environment directory (with a notice on stderr).
+                   --here requires the current directory (asks before sharing
+                   it on a terminal, fails otherwise); --workdir DIR runs from
+                   DIR in the environment
 cage claude        Run Claude Code in the shared environment
 cage stop          Stop the shared Cage environment and its proxy core
                    --keep-proxy keeps the core running for an environment restart
@@ -94,18 +102,25 @@ func run() int {
 	// The shared commands otherwise name agent-vm and suggest its installer.
 	cli.Command = "claude-cage"
 	cli.UpdateHint = "update Cage from the app, or with the installer or package that installed it"
+	// --reset deletes the environment's disk with the user's files and logins.
+	cli.StaleBaseHint = "提示：Cage 的基础镜像比当前环境新。当前环境的磁盘会保留，不需要重建；请在 Cage 的“设置 > 环境与恢复”中更新环境组件或环境工具，也可以运行 cage update-tools。"
 	args := os.Args[1:]
-	if len(args) > 0 && args[0] == "host-download" {
-		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-		defer cancel()
-		if err := hostDownload(ctx, args[1:], os.Stdout); err != nil {
-			return fail(err)
-		}
-		return 0
-	}
 	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
 		fmt.Print(help)
 		return 0
+	}
+	if text, ok := subcommandHelp(args); ok {
+		fmt.Print(text)
+		return 0
+	}
+	var startArgs []string
+	if args[0] == "up" || args[0] == "login" {
+		var err error
+		startArgs, err = cli.StartArgs(args[1:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\nUsage: cage %s [--reset]\n", err, args[0])
+			return 2
+		}
 	}
 	// These read only this build's own metadata. Answering them before the
 	// profile is opened keeps `cage version --min` usable on a fresh install.
@@ -124,14 +139,7 @@ func run() int {
 		}
 		return 0
 	}
-	if len(args) == 1 && (args[0] == "verify-macos-guest" || args[0] == "verify-macos-trial") {
-		if !macGuestLoginAvailable() {
-			return fail(fmt.Errorf("this helper was built without the virtual Mac login view"))
-		}
-		return 0
-	}
-	macGuestCommand := len(args) >= 2 && args[0] == "guest-os" && args[1] == "macos"
-	if args[0] == "guest-os" && !macGuestCommand {
+	if args[0] == "guest-os" {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		if err := writeGuestOSInspection(ctx, args[1:], os.Stdout); err != nil {
@@ -143,28 +151,13 @@ func run() int {
 		if len(args) != 1 {
 			return 2
 		}
-		dir, err := os.MkdirTemp("", "cage-vm-assets-")
-		if err != nil {
+		if err := verifyVMAssets(os.MkdirTemp, func(dir string) error {
+			_, err := limaembed.WriteShare(dir)
+			return err
+		}); err != nil {
 			return fail(err)
-		}
-		defer os.RemoveAll(dir)
-		share, err := limaembed.WriteShare(dir)
-		if err != nil {
-			return fail(err)
-		}
-		if runtime.GOOS == "darwin" {
-			arch := "aarch64"
-			if runtime.GOARCH == "amd64" {
-				arch = "x86_64"
-			}
-			if _, err := share.GuestAgent("Darwin", arch); err != nil {
-				return fail(err)
-			}
 		}
 		return 0
-	}
-	if err := host.ConfigureWindowsRuntime(); err != nil {
-		return fail(err)
 	}
 	path := os.Getenv(cage.ConfigEnv)
 	if path == "" {
@@ -175,17 +168,34 @@ func run() int {
 	if err != nil {
 		return fail(err)
 	}
-	store := diagnostics.New(filepath.Dir(path))
-	diagnostics.SetDefault(store)
-	if args[0] == "windows-network-host" {
-		if len(args) != 1 {
-			return fail(fmt.Errorf("windows-network-host takes its bound configuration from the profile"))
+	if args[0] == "interface-language" {
+		if len(args) == 3 && args[1] == "--seed-windows-id" {
+			id, err := strconv.Atoi(args[2])
+			if err == nil {
+				err = uilocale.SeedWindowsInstallerChoice(filepath.Dir(path), id)
+			}
+			if err != nil {
+				return fail(err)
+			}
+			return 0
 		}
-		if err := workbench.ServeWindowsPacketNetwork(path); err != nil {
+		if len(args) != 2 || args[1] != "--json" {
+			return 2
+		}
+		language, err := uilocale.Native(filepath.Dir(path))
+		if err != nil {
+			return fail(err)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(language); err != nil {
 			return fail(err)
 		}
 		return 0
 	}
+	if err := host.ConfigureWindowsRuntime(); err != nil {
+		return fail(err)
+	}
+	store := diagnostics.New(filepath.Dir(path))
+	diagnostics.SetDefault(store)
 	if args[0] == "container-runtime" {
 		if len(args) != 2 {
 			return fail(fmt.Errorf("container-runtime prepare|start|stop|inspect"))
@@ -477,14 +487,10 @@ func run() int {
 		if err = host.EnsurePrivateDir(filepath.Dir(path)); err != nil {
 			return fail(err)
 		}
-		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-		if err != nil {
-			return fail(err)
+		data, err := json.MarshalIndent(cage.DefaultConfig(), "", "  ")
+		if err == nil {
+			err = host.CreatePrivateFile(path, append(data, '\n'))
 		}
-		enc := json.NewEncoder(f)
-		enc.SetIndent("", "  ")
-		err = enc.Encode(cage.DefaultConfig())
-		f.Close()
 		if err != nil {
 			return fail(err)
 		}
@@ -506,10 +512,11 @@ func run() int {
 	os.Setenv(cage.ConfigEnv, path)
 	profile := filepath.Dir(path)
 	state := filepath.Join(profile, "state")
+	limaHome := filepath.Join(state, "lima")
 	os.Unsetenv("CAGE_LIMA_CACHE_DIR")
 	os.Unsetenv("CAGE_LOGICAL_LIMA_HOME")
 	if !containerenv.Configured(profile) {
-		if err = guestos.RecoverWindowsStorage(context.Background(), profile); err != nil {
+		if err = cage.RecoverStorage(context.Background(), profile, nil); err != nil {
 			return fail(err)
 		}
 		lease, location, err := cage.AcquireStorageUse(profile)
@@ -520,19 +527,17 @@ func run() int {
 		// Keep image caches on the same volume the initialization page shows,
 		// including the default location. The saved path survives app updates.
 		os.Setenv("CAGE_LIMA_CACHE_DIR", filepath.Join(location.Directory, "cache", "lima"))
+		limaHome, err = cage.ProfileLimaHome(profile, location.Custom)
+		if err != nil {
+			return fail(err)
+		}
 		if location.Custom {
-			// Resolve the profile prefix once, as Lima did before migration.
-			// Keep state itself logical so its original disk and socket paths survive.
-			realProfile, err := filepath.EvalSymlinks(profile)
-			if err != nil {
-				return fail(err)
-			}
-			state = filepath.Join(realProfile, "state")
-			os.Setenv("CAGE_LOGICAL_LIMA_HOME", filepath.Join(state, "lima"))
+			state = filepath.Dir(limaHome)
+			os.Setenv("CAGE_LOGICAL_LIMA_HOME", limaHome)
 		}
 	}
 	os.Setenv("AGENT_VM_STATE_DIR", state)
-	os.Setenv("AGENT_VM_LIMA_HOME", filepath.Join(state, "lima"))
+	os.Setenv("AGENT_VM_LIMA_HOME", limaHome)
 	// Do not inherit host proxy settings or credentials into VM operations.
 	for _, name := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "ftp_proxy", "no_proxy", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"} {
 		os.Unsetenv(name)
@@ -543,19 +548,18 @@ func run() int {
 	if limaembed.Run(args) {
 		return 0
 	}
-	if macGuestCommand {
-		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-		defer cancel()
-		if err := runMacGuest(ctx, profile, state, args[2:]); err != nil {
-			return fail(err)
-		}
-		return 0
-	}
 	if args[0] == "proxy-start" || args[0] == "proxy-stop" {
 		if err := proxyCommand(args[0], filepath.Dir(path), cfg); err != nil {
 			return fail(err)
 		}
 		return 0
+	}
+	if args[0] == "run" {
+		// Before the switch to the environment directory below.
+		here, hereErr := os.Getwd()
+		if args, err = followRunDirectory(path, args, here, hereErr, os.Stderr, terminalConfirm(os.Stdin, os.Stderr)); err != nil {
+			return fail(err)
+		}
 	}
 	if handled, err := containerOperation(path, args, cfg, keepProxy); handled {
 		if err != nil {
@@ -591,19 +595,13 @@ func run() int {
 	}
 
 	if args[0] == "check" {
-		e, err := cage.NewEgress(cfg)
+		// Use the same fixed exit services as the network check, so one
+		// blocked endpoint does not fail this check on its own.
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		err := checkProxyTransport(ctx, filepath.Dir(path), cfg)
+		cancel()
 		if err != nil {
-			return fail(err)
-		}
-		client := &http.Client{Timeout: 25 * time.Second, Transport: &http.Transport{DialContext: e.DialContext, Proxy: nil}}
-		req, _ := http.NewRequestWithContext(context.Background(), "GET", "https://1.1.1.1/cdn-cgi/trace", nil)
-		r, err := client.Do(req)
-		if err != nil {
-			return fail(fmt.Errorf("proxy transport check failed (no direct fallback)"))
-		}
-		r.Body.Close()
-		if r.StatusCode != 200 {
-			return fail(fmt.Errorf("proxy check returned HTTP %d", r.StatusCode))
+			return fail(fmt.Errorf("proxy transport check failed (no direct fallback): %w", err))
 		}
 		fmt.Println("Proxy transport OK. Guest traffic still requires VM acceptance checks.")
 		return 0
@@ -631,27 +629,22 @@ func run() int {
 		if resourceErr != nil {
 			return fail(resourceErr)
 		}
-		args = append([]string{"setup", "--memory", fmt.Sprint(memory), "--cpus", fmt.Sprint(cpus), "--disk", "24", "--preinstall=node,python,chromium,gh,claude,code-server"}, args[1:]...)
+		disk, diskErr := cage.ConfiguredDiskLimit(path)
+		if diskErr != nil {
+			return fail(diskErr)
+		}
+		args = append([]string{"setup", "--memory", fmt.Sprint(memory), "--cpus", fmt.Sprint(cpus), "--disk", fmt.Sprint(disk), "--preinstall=node,python,chromium,gh,claude,code-server"}, requireWorkbenchTools(args[1:])...)
 	}
 	if args[0] == "up" || args[0] == "login" {
-		result := cli.Main([]string{"run", "true"}, cli.Stdio())
-		if result != 0 {
-			return result
-		}
-		if err := workbench.StartGuestServices(context.Background(), path, os.Stdout, os.Stderr); err != nil {
-			return fail(err)
-		}
-		fmt.Println("Cage local services are ready. Open Cage or run cage desktop to complete the required network checks. External networking stays closed until the workbench approves this VM; no local access password is required.")
-		if args[0] == "login" {
-			return cli.Main([]string{"run", "--tty", "bash", "-lc", "source /etc/profile.d/claude-cage.sh; exec claude auth login"}, cli.Stdio())
-		}
-		return 0
+		return startEnvironment(args[0], startArgs, cli.Stdio(), cli.Main, func() error {
+			return workbench.StartGuestServices(context.Background(), path, os.Stdout, os.Stderr)
+		})
 	}
 	if args[0] == "update-tools" {
 		if result := cli.Main([]string{"run", "true"}, cli.Stdio()); result != 0 {
 			return result
 		}
-		if err := workbench.RunMaintenanceScript(context.Background(), path, cage.ToolsUpdateScript(), os.Stdout, os.Stderr); err != nil {
+		if err := workbench.RunMaintenanceScript(context.Background(), path, cage.ToolsUpdateScriptFor(os.Getenv(cage.InstallTLS12Env) == "1"), os.Stdout, os.Stderr); err != nil {
 			return fail(err)
 		}
 		return 0
@@ -663,6 +656,9 @@ func run() int {
 	if !allowed[args[0]] {
 		return fail(fmt.Errorf("unknown cage command %q; see cage help", args[0]))
 	}
+	if args[0] == "run" || args[0] == "shell" || args[0] == "claude" {
+		warnClosedNetwork(path, os.Stderr)
+	}
 	return cli.Main(args, cli.Stdio())
 }
 
@@ -671,7 +667,7 @@ func containerInstallScript(kind string) (string, error) {
 	case "services":
 		return cage.GuestSetup, nil
 	case "tools":
-		script := "set -e\nexport CLAUDE_CAGE=1\n" + cage.APTBootstrapScript + "\n" + cage.ToolInstallPrelude()
+		script := "set -e\nexport CLAUDE_CAGE=1\n" + cage.InstallTLS12Prelude(os.Getenv(cage.InstallTLS12Env) == "1") + cage.APTBootstrapScript + "\n" + cage.ToolInstallPrelude()
 		enabled := map[string]bool{"NODE": true, "PYTHON": true, "CHROMIUM": true, "GH": true, "CLAUDE": true, "CODE_SERVER": true}
 		for _, name := range []string{"PYTHON", "NODE", "RUBY", "RUST", "GOLANG", "DOCKER", "CHROMIUM", "GH", "CLAUDE", "OPENCODE", "CODEX", "VIBE", "PI", "CODE_SERVER", "CODE_CLAUDE", "CODE_OPENCODE", "CODE_CODEX", "CODE_VIBE", "MCP_CHROME", "MCP_PLAYWRIGHT"} {
 			value := "0"
@@ -691,6 +687,95 @@ func containerInstallScript(kind string) (string, error) {
 func runGuestServiceStart(script string, stdio cli.IO, invoke func([]string, cli.IO) int) int {
 	stdio.Stdin = strings.NewReader(script)
 	return invoke([]string{"run", "bash", "-s"}, stdio)
+}
+
+func startEnvironment(command string, args []string, stdio cli.IO, invoke func([]string, cli.IO) int, startServices func() error) int {
+	if result := invoke(args, stdio); result != 0 {
+		return result
+	}
+	if err := startServices(); err != nil {
+		return fail(err)
+	}
+	fmt.Fprintln(stdio.Stdout, "Cage local services are ready. Open Cage, run cage desktop or run 'cage agent call network.check --wait 5m' to complete the required network checks. External networking stays closed until the workbench approves this VM; no local access password is required.")
+	if command == "login" {
+		return invoke([]string{"run", "--tty", "bash", "-lc", "source /etc/profile.d/claude-cage.sh; exec claude auth login"}, stdio)
+	}
+	return 0
+}
+
+// The shared environment's start script needs these tools. A --preinstall
+// list given to `cage setup`, such as "default", keeps its choices and gains
+// any of them it lacks, so the base it builds can always start.
+var workbenchTools = []string{"chromium", "code-server"}
+
+func requireWorkbenchTools(args []string) []string {
+	complete := func(list string) string {
+		if list == "" {
+			list = "default"
+		}
+		names := strings.Split(list, ",")
+		for _, tool := range workbenchTools {
+			if !slices.Contains(names, tool) {
+				names = append(names, tool)
+			}
+		}
+		return strings.Join(names, ",")
+	}
+	result := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		switch a := args[i]; {
+		case strings.HasPrefix(a, "--preinstall="):
+			result = append(result, "--preinstall="+complete(strings.TrimPrefix(a, "--preinstall=")))
+		case a == "--preinstall":
+			// As in setup, only a following non-option is its value.
+			value := ""
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				i++
+				value = args[i]
+			}
+			result = append(result, "--preinstall="+complete(value))
+		default:
+			result = append(result, a)
+		}
+	}
+	return result
+}
+
+// Commands whose remaining arguments belong to a program in the environment,
+// such as `cage run ls -h`, or that answer --help themselves.
+var helpPassthrough = map[string]bool{
+	"agent": true, "run": true, "shell": true, "sh": true, "claude": true, "code": true,
+	"opencode": true, "codex": true, "vibe": true, "pi": true,
+}
+
+// subcommandHelp answers `cage COMMAND --help` before the command opens or
+// creates a profile, so asking for help never runs it. It prints the
+// command's lines from the overview, or the overview when it has none.
+func subcommandHelp(args []string) (string, bool) {
+	if len(args) < 2 || args[1] != "--help" && args[1] != "-h" || helpPassthrough[args[0]] {
+		return "", false
+	}
+	if (args[0] == "up" || args[0] == "login") && len(args) != 2 {
+		return "", false
+	}
+	var lines []string
+	matched := false
+	for _, line := range strings.Split(help, "\n") {
+		switch {
+		case strings.HasPrefix(line, "cage "):
+			fields := strings.Fields(line)
+			matched = len(fields) > 1 && fields[1] == args[0]
+		case !strings.HasPrefix(line, " "):
+			matched = false
+		}
+		if matched {
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) == 0 {
+		return help, true
+	}
+	return strings.Join(lines, "\n") + "\n\nRun 'cage --help' for all commands.\n", true
 }
 
 func fail(err error) int {
@@ -727,7 +812,11 @@ func relay(configPath, kind string) int {
 			return fail(err)
 		}
 		profile := filepath.Dir(configPath)
-		cmd = exec.Command(core, "-d", managedproxy.Dir(profile), "-f", filepath.Join(managedproxy.Dir(profile), "config.yaml"))
+		runtimePath := filepath.Join(managedproxy.Dir(profile), "config.yaml")
+		if _, err := managedproxy.BoundInterface(runtimePath); err != nil {
+			return fail(err)
+		}
+		cmd = exec.Command(core, "-d", managedproxy.Dir(profile), "-f", runtimePath)
 		source = "proxy"
 	} else {
 		return 2
@@ -786,4 +875,16 @@ func expectedRelayStop(err error, forwarded os.Signal) bool {
 	}
 	status, ok := exit.Sys().(syscall.WaitStatus)
 	return ok && status.Signaled() && status.Signal() == signal || exit.ExitCode() == 128+int(signal)
+}
+
+func verifyVMAssets(mktemp func(string, string) (string, error), writeShare func(string) error) error {
+	dir, err := mktemp("", "cage-vm-assets-")
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			return fmt.Errorf("%w (ensure TEMP/TMP points to a writable directory; on Windows, executables built in a Low Mandatory Level / sandboxed checkout directory cannot write to %%TEMP%% — move the repository to a normal local directory such as C:\\src\\Claude-Cage)", err)
+		}
+		return err
+	}
+	defer os.RemoveAll(dir)
+	return writeShare(dir)
 }

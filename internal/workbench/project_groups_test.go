@@ -9,8 +9,6 @@ import (
 	"slices"
 	"strings"
 	"testing"
-
-	"github.com/sylvinus/agent-vm/internal/guestos"
 )
 
 func groupFixture(t *testing.T) (*Server, string, string) {
@@ -54,24 +52,9 @@ func TestProjectGroupSaveReloadLegacyAndLaunchDirectories(t *testing.T) {
 	if err != nil || len(paths) != 3 || !slices.Contains(paths, other) {
 		t.Fatal(paths, err)
 	}
-	for _, platform := range []string{"linux", "macos", "windows"} {
-		t.Run(platform, func(t *testing.T) {
-			s.macosGuest, s.windowsGuest = nil, nil
-			expected := guestPath(b)
-			if platform == "macos" {
-				s.macosGuest = &guestos.MacOSProfile{User: "developer"}
-				expected = macOSProjectPath("developer", b)
-			}
-			if platform == "windows" {
-				s.windowsGuest = &guestos.WindowsProfile{}
-				expected = `C:\Users\dev\Projects\backend`
-				s.projectShares[b].windowsProject = &windowsProjectBinding{ID: "binding", Grant: "grant", Path: expected}
-			}
-			actual, err := s.projectAdditionalDirectories(a)
-			if err != nil || !slices.Equal(actual, []string{expected}) {
-				t.Fatalf("directories=%q err=%v", actual, err)
-			}
-		})
+	actual, err := s.projectAdditionalDirectories(a)
+	if err != nil || !slices.Equal(actual, []string{guestPath(b)}) {
+		t.Fatalf("directories=%q err=%v", actual, err)
 	}
 }
 
@@ -148,5 +131,31 @@ func TestProjectGroupsCannotTakeAnotherNamedProjectsFolders(t *testing.T) {
 	groups, _ := s.projectGroups()
 	if len(groups) != 1 || groups[0].Name != "first" {
 		t.Fatal("failed save modified groups", groups)
+	}
+}
+
+func TestProjectGroupRenameOnlyWhenStopped(t *testing.T) {
+	s, a, b := groupFixture(t)
+	saveGroupRequest(t, s, projectGroup{Name: "initial", Folders: []string{a}}, 200)
+	s.ready = false
+	s.projectShares = nil
+	saveGroupRequest(t, s, projectGroup{Workspace: a, Name: "renamed-offline", Folders: []string{a}}, 200)
+	groups, err := s.projectGroups()
+	if err != nil || len(groups) != 1 || groups[0].Name != "renamed-offline" || !slices.Equal(groups[0].Folders, []string{a}) {
+		t.Fatalf("groups=%+v err=%v", groups, err)
+	}
+	// Modifying folders while stopped still requires a ready environment.
+	saveGroupRequest(t, s, projectGroup{Workspace: a, Name: "add-offline", Folders: []string{a, b}}, 409)
+	saveGroupRequest(t, s, projectGroup{Name: "new-offline", Folders: []string{b}}, 409)
+}
+
+func TestRenamingClientShareIsRejectedAndNotPersisted(t *testing.T) {
+	s := testServer(t)
+	s.ready = true
+	path := clientMountRoot + "/" + strings.Repeat("c", 32)
+	s.clientMounts = map[string]*guestClientMount{path: {ctx: t.Context(), ready: true}}
+	saveGroupRequest(t, s, projectGroup{Workspace: path, Name: "renamed", Folders: []string{path}}, http.StatusBadRequest)
+	if _, err := os.Stat(filepath.Join(s.profile, "projects.json")); !os.IsNotExist(err) {
+		t.Fatalf("temporary client share was persisted: %v", err)
 	}
 }

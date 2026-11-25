@@ -1,29 +1,17 @@
-# Complete the browser change before interrupting access to the running session.
-if cage_is_ubuntu && [[ ! -x /usr/local/lib/workbench-browser/chromium ]]; then
-  cage_install_ubuntu_browser
-fi
 # Publish browser assets while the web endpoint is stopped, so clients cannot
 # mix old and new noVNC modules during an upgrade.
 if systemctl is-active --quiet cage-webvnc; then
   sudo systemctl stop cage-webvnc
 fi
-if ! command -v Xtigervnc >/dev/null || ! command -v openbox >/dev/null || ! command -v xrandr >/dev/null || ! command -v xdotool >/dev/null || ! command -v ibus-daemon >/dev/null || ! /usr/bin/python3 -c 'import gi; gi.require_version("IBus", "1.0"); gi.require_version("Gtk", "3.0")' 2>/dev/null; then
-  sudo env DEBIAN_FRONTEND=noninteractive APT_CONFIG="${CAGE_APT_CONFIG:-/dev/null}" apt-get install -y --no-install-recommends tigervnc-standalone-server tigervnc-tools openbox x11-xserver-utils xdotool libgtk-3-0 ibus ibus-gtk3 gir1.2-ibus-1.0 gir1.2-gtk-3.0 python3-gi python3-xlib xsettingsd
-fi
-cage_novnc_root=/usr/share/novnc
-if cage_is_ubuntu; then
-  # snap run tracks Chromium in this dedicated user's systemd session.
-  sudo loginctl enable-linger cage-browser
-  sudo systemctl start "user@$(id -u cage-browser).service"
-  cage_install_ubuntu_novnc
-  cage_novnc_root=/usr/local/share/cage-novnc
+if ! command -v ip >/dev/null || ! test -x /usr/sbin/iptables || ! command -v Xtigervnc >/dev/null || ! command -v openbox >/dev/null || ! command -v xrandr >/dev/null || ! command -v xdotool >/dev/null || ! command -v ibus-daemon >/dev/null || ! /usr/bin/python3 -c 'import gi; gi.require_version("IBus", "1.0"); gi.require_version("Gtk", "3.0")' 2>/dev/null; then
+  sudo env DEBIAN_FRONTEND=noninteractive APT_CONFIG="${CAGE_APT_CONFIG:-/dev/null}" apt-get install -y --no-install-recommends tigervnc-standalone-server tigervnc-tools openbox x11-xserver-utils xdotool libgtk-3-0 ibus ibus-gtk3 gir1.2-ibus-1.0 gir1.2-gtk-3.0 python3-gi python3-xlib xsettingsd iproute2 iptables
 fi
 sudo install -d -m 0755 /usr/local/share
+cage_novnc_root=/usr/share/novnc
 sudo ln -sfn "$cage_novnc_root" /usr/local/share/cage-webvnc
 sudo install -d -m 0755 /etc/claude-cage /usr/local/lib
 # New website passwords belong to the host vault. Keep existing browser data.
 cage_browser_policy_dir=/etc/chromium/policies/managed
-if cage_is_ubuntu; then cage_browser_policy_dir=/etc/chromium-browser/policies/managed; fi
 sudo install -d -m 0755 "$cage_browser_policy_dir"
 printf '%s\n' '{"PasswordManagerEnabled":false}' | sudo tee "$cage_browser_policy_dir/cage-password-vault.json" >/dev/null
 sudo chmod 0644 "$cage_browser_policy_dir/cage-password-vault.json"
@@ -33,6 +21,7 @@ if ! command -v xdg-mime >/dev/null; then
 fi
 sudo install -d -m 0755 /usr/local/share/applications
 printf '%s\n' '[Desktop Entry]' 'Type=Application' 'Name=Tailscale' 'NoDisplay=true' 'Exec=/usr/local/bin/cage-open %u' 'MimeType=x-scheme-handler/tailscale;' | sudo tee /usr/local/share/applications/tailnet-login.desktop >/dev/null
+sudo -H -u cage-browser sh -ec 'mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}"'
 sudo -H -u cage-browser xdg-mime default tailnet-login.desktop x-scheme-handler/tailscale
 sudo tee /usr/local/bin/cage-editor-start >/dev/null <<'SCRIPT'
 #!/bin/sh
@@ -57,14 +46,28 @@ TimeoutStopSec=15
 UNIT
 printf 'cage-browser ALL=(root) NOPASSWD: /usr/bin/systemctl restart cage-editor.service\n' | sudo tee /etc/sudoers.d/cage-editor >/dev/null
 sudo chmod 0440 /etc/sudoers.d/cage-editor
+# Every shell, and every program that reads a login shell's environment,
+# takes only the standard time and locale settings from the service
+# environment. Values the services use internally stay with those services.
 sudo tee /etc/profile.d/claude-cage.sh >/dev/null <<'SCRIPT'
-if [ -f /etc/claude-cage/environment ]; then
-  set -a
-  . /etc/claude-cage/environment
-  set +a
+if [ -r /etc/claude-cage/environment ]; then
+  while IFS='=' read -r env_key env_value || [ -n "$env_key" ]; do
+    case $env_key in
+      TZ|LANG|LC_ALL) export "$env_key=$env_value" ;;
+    esac
+  done < /etc/claude-cage/environment
+  unset env_key env_value
+fi
+unset CAGE_LANGUAGE
+# PulseAudio clients find the shared server in the system client configuration.
+if [ "${PULSE_SERVER:-}" = unix:/run/cage-audio/native ]; then
+  unset PULSE_SERVER
 fi
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY FTP_PROXY NO_PROXY http_proxy https_proxy all_proxy ftp_proxy no_proxy
-export BROWSER=/usr/local/bin/cage-open
+# Keep a browser opener handed down by the launcher; replace only the old path.
+case ${BROWSER:-/usr/local/bin/cage-open} in
+  /usr/local/bin/cage-open) export BROWSER=/usr/local/bin/xdg-open ;;
+esac
 SCRIPT
 if ! grep -q '/etc/profile.d/claude-cage.sh' /etc/zsh/zshenv; then
   echo '. /etc/profile.d/claude-cage.sh' | sudo tee -a /etc/zsh/zshenv >/dev/null

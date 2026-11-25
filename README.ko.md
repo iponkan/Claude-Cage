@@ -18,11 +18,23 @@
 
 </div>
 
+## 설계 철학
+
+1. **Claude 자체는 안전하지만, 그 실행 껍질(harness)과 관련 프로그램은 그렇지 않습니다.** Claude Code, Claude Desktop, 그리고 브라우저가 접하는 이메일·웹페이지와 각종 환경 신호가 여기에 포함됩니다.
+2. **안전하게 Claude의 능력을 쓰는 방법은 보통 두 가지입니다: 역방향 프록시 또는 원격 제어.** Claude를 서버에서 꺼내 호스트에서 직접 돌리거나, 격리된 환경에 두고 호스트를 통제된 방식으로 조작하게 하는 것입니다. 우리는 후자가 더 안전하고 규정에도 부합한다고 봅니다.
+3. **따라서 Cage의 핵심은 Claude 관련 프로그램을 위한 가벼운 로컬 격리 환경을 만들고, 표준 MCP 플러그인으로 호스트 기능을 안전하고 통제된 방식으로 쓰게 하는 것입니다.** 모든 외부 호출에 권한 선언과 사용자 승인이 따르므로 직접 SSH를 여는 것보다 안전합니다.
+
+이를 통해 Cage는 세 가지 목표를 동시에 이룹니다:
+
+- **위험한 부분은 가두고, 유용한 능력은 밖으로 내보냅니다.** Claude 아가씨가 Cage 안에서 작은 게 위에 편히 앉아 손만 뻗어 바깥의 일을 처리할 수 있습니다 — Cage 안에 사무실 전체를 새로 지을 필요가 없습니다.
+- **플러그인 마켓으로 오픈소스 커뮤니티와 느슨하게 협업합니다.** 개방된 [플러그인 마켓(cage-plugins)](https://github.com/Lee-xeo/cage-plugins)에서 **플러그인 = MCP + 확장**은 각각 「Claude의 능력」과 「Cage 워크벤치 맞춤화」에 대응합니다. 커뮤니티는 Cage 본체 이슈 대신 플러그인 마켓에 지혜를 모으고, Cage 유지보수 팀은 격리 환경과 워크벤치 본체에 집중합니다.
+- **규정 준수, 안전, 경량, 로컬, 저비용, 원클릭 설치와 즉시 사용.** 복잡한 다중 OS 게스트를 유지할 필요도, Claude의 능력이 갇힐 걱정도, 비싼 클라우드 비용이나 데이터 유출 걱정도 없이 내 컴퓨터에서 우아하게 모든 것을 해결합니다.
+
 ## Anthropic에 지쳤습니다
 
-클로드와 대화하고 협업하고 싶은 일반 사용자로서 VPS 인스턴스, 브라우저 지문 프로필, 환경 확인을 구성하는 데 지쳤으며 계정 금지 및 금전적 손실을 걱정합니다. 우리는 선물한다 **Claude Cage** — **즉시 사용 가능한 데스크탑 애플리케이션: 자체 네트워크 프록시를 구성하고 격리된 환경, 시간대, 언어 및 환경 확인을 한 곳에서 관리합니다.**
+클로드와 대화하고 협업하고 싶은 일반 사용자로서 VPS 인스턴스, 브라우저 지문 프로필, 환경 확인을 구성하는 데 지쳤으며 계정 금지 및 금전적 손실을 걱정합니다. 우리는 **Claude Cage**를 제안합니다 — **즉시 사용 가능한 데스크톱 애플리케이션: 자체 네트워크 프록시를 구성하고 가벼운 격리 환경, 시간대, 언어, 환경 확인과 플러그인 기능을 한곳에서 관리합니다.**
 
-Claude Cage는 터미널, 브라우저, 편집기와 공식 Claude Desktop을 하나의 격리된 작업 공간에 모읍니다. Mac에서는 macOS 가상 머신을, 지원되는 Windows PC에서는 Windows 가상 머신을 사용하거나 가벼운 Linux 환경을 선택하세요. 필요한 프로젝트만 공유하고 네트워크를 따로 관리하며, SSH로 서버에 연결하거나 휴대폰에서 작업을 이어갈 수 있습니다. 주요 기능:
+Claude Cage는 터미널, 브라우저, 편집기, 공식 Claude Desktop과 플러그인 마켓을 하나의 격리된 작업 공간에 모읍니다. macOS, Windows, Linux 어디에서나 동일한 가벼운 Debian 13 환경을 사용합니다. 필요한 프로젝트만 공유하고 네트워크를 따로 관리하며, 플러그인으로 호스트 도구를 안전하게 호출하거나 SSH로 서버에 연결하고 휴대폰에서 작업을 이어갈 수 있습니다. 주요 기능:
 
 - 호스트와 격리된 네트워크 설정 Cage는 자체 네트워크 프록시를 통해 환경 내부의 모든 네트워크 트래픽을 라우팅합니다.
 - 네트워크 프록시의 IP 위치에 대한 자동 동기화를 통해 시간대 및 언어를 포함하여 호스트에서 격리된 브라우저 지문 설정
@@ -44,7 +56,8 @@ Claude Cage는 터미널, 브라우저, 편집기와 공식 Claude Desktop을 �
 ## 케이지로 할 수 있는 일
 
 - **단일 창에서 작업합니다.** 터미널에서 Claude Code를 실행하고, 편집기에서 변경 사항을 검토하고, Cage 브라우저를 사용하여 서비스를 미리 보고 로그인하세요.
-- **익숙한 시스템에서 개발하세요.** macOS, Windows 또는 Linux 게스트에서 해당 플랫폼의 도구를 사용하거나, 호스트 시스템을 복제해 깨끗하고 독립적인 환경을 만드세요. [게스트 시스템 선택](docs/guide/guest-systems.md)
+- **플러그인 마켓으로 모든 능력을 열어 보세요.** 개방형 [플러그인 마켓(cage-plugins)](https://github.com/Lee-xeo/cage-plugins)을 내장해 「플러그인 = MCP + 확장」을 지원합니다. 화면·키보드·마우스 제어, Office 문서, Blender, 호스트 명령 같은 MCP 도구를 안전하고 통제된 승인 아래 연결하고, 샌드박스 페이지로 Cage를 맞춤화할 수 있습니다. [플러그인 가이드](docs/guide/plugins.md) · [개발 명세](docs/plugins.md)
+- **모든 플랫폼에서 같은 경량 환경.** macOS, Windows, Linux의 Cage는 모두 동일한 경량 Debian 13 환경을 사용해 복잡한 다중 OS 게스트 없이 도구와 사용 방법이 같습니다. [Debian 환경](docs/guide/guest-systems.md)
 - **공유하는 내용을 제어하세요.** 기본 작업공간과 명시적으로 열린 프로젝트 폴더만 공유됩니다. 호스트의 Claude 로그인 상태, 브라우저 프로필 및 SSH 키는 자동으로 가져오지 않습니다.
 - **네트워크 상태를 확인하세요.** 내장된 네트워크 프록시 관리를 통해 구독을 가져오고, 엔드포인트를 선택하고, 종료 IP를 확인할 수 있습니다. 중요한 검사가 통과될 때까지 환경은 오프라인 상태로 유지됩니다. 네트워크 프록시를 사용할 수 없는 경우 직접 연결로 대체할 수 없습니다.
 - **다음에 계속하세요.** 도구, 파일 및 로그인 상태는 가상 디스크에 유지됩니다. 창을 닫아도 백그라운드 작업이 계속 실행될 수 있습니다.
@@ -65,13 +78,13 @@ https://github.com/Lee-xeo/Claude-Cage의 최신 소스 코드를 받아 빌드�
 
 ## 다운로드 및 설치
 
-Cage는 macOS, Windows, Linux를 지원합니다. 대상은 macOS 14+의 Apple Silicon Mac, Windows 10 22H2 / 11 x64, Debian 12 / Ubuntu 22.04 / 24.04 x86_64. Intel Mac, Windows ARM64, Linux ARM64는 아직 지원하지 않습니다. [macOS](docs/getting-started.md) · [Windows](docs/windows.md) · [Linux](docs/linux.md).
+Cage는 macOS, Windows, Linux를 지원합니다. 대상은 macOS 14+의 Apple Silicon Mac과 Intel Mac, Windows 10 22H2 / 11 x64, Debian 12 / Ubuntu 22.04 / 24.04 x86_64입니다. Windows ARM64, Linux ARM64는 아직 지원하지 않습니다. [macOS](docs/getting-started.md) · [Windows](docs/windows.md) · [Linux](docs/linux.md).
 
 1. 앱 다운로드: [macOS / Windows / Linux](https://claude-cage.com/ko/#download).
 2. macOS: 설치 패키지를 열고 드래그하세요. **Cage** 으로 **응용**; 그런 다음 응용 프로그램에서 실행하십시오. Windows: [설치 안내](docs/windows.md#安装并开始工作) · Linux: [설치 안내](docs/linux.md#安装并开始工作).
 3. 앱 내 지침에 따라 자신의 네트워크 프록시를 구성하고, 환경을 시작하고, 프로젝트를 엽니다.
 
-설치 패키지에는 작업 공간과 프록시 엔진이 포함됩니다. Go, Node.js, Docker, Clash를 미리 설치할 필요가 없습니다. 환경을 만들 때 게스트 시스템과 저장 위치를 선택하고 공식 이미지와 개발 도구를 준비하세요. Cage는 운영체제 라이선스, 프록시 서비스나 Claude 계정을 제공하지 않습니다.
+설치 패키지에는 작업 공간과 프록시 엔진이 포함됩니다. Go, Node.js, Docker, Clash를 미리 설치할 필요가 없습니다. 환경을 만들 때 저장 위치를 선택하면 Cage가 Debian 13 이미지와 개발 도구를 내려받습니다. Cage는 프록시 서비스나 Claude 계정을 제공하지 않습니다.
 
 소스 코드와 설치 패키지는 공개되어 있습니다. 버전 안내와 체크섬은 [Releases](https://github.com/Lee-xeo/Claude-Cage/releases)에서 확인하세요.
 
@@ -87,7 +100,7 @@ macOS와 서명된 Windows 버전은 선택한 프록시를 통해 업데이트�
 
 ### 2. 환경 시작
 
-처음 만들 때 게스트 시스템 또는 호스트 시스템 복제와 저장 위치를 선택하세요. Cage 환경을 시작하고 설치와 권한 안내를 따르세요. 작업 상세에서 진행 상태와 오류를 볼 수 있습니다. 이후에는 같은 환경을 다시 사용합니다.
+처음 만들 때 저장 위치를 선택하세요. Cage 환경을 시작하고 설치와 권한 안내를 따르세요. 작업 상세에서 진행 상태와 오류를 볼 수 있습니다. 이후에는 같은 환경을 다시 사용합니다.
 
 ### 3. 프로젝트를 열고 Claude를 실행하세요.
 
@@ -96,7 +109,7 @@ macOS와 서명된 Windows 버전은 선택한 프록시를 통해 업데이트�
 ## 사용하기 전에 이러한 제한 사항을 이해하십시오.
 
 - 공유 프로젝트의 편집 및 삭제는 컴퓨터의 파일에 직접적인 영향을 미칩니다. 버전 제어 또는 백업을 사용하십시오. 프로젝트의 `.git`은 읽기와 쓰기가 가능하며 Cage에서 변경 사항을 스테이징하고 커밋하거나 브랜치를 전환할 수 있습니다.
-- 모든 프로젝트는 도구, 계정 및 macOS / Windows / Debian / Ubuntu 22.04 파일 시스템을 포함하여 하나의 Cage 환경을 공유합니다. 프로젝트는 서로 격리되지 않습니다.
+- 모든 프로젝트는 도구, 계정 및 Debian 파일 시스템을 포함하여 하나의 Cage 환경을 공유합니다. 프로젝트는 서로 격리되지 않습니다.
 - 기본 인터넷 아웃바운드는 IPv4 TCP를 지원하며 DNS는 같은 프록시를 사용합니다. 인터넷 UDP, IPv6, ICMP와 호스트·LAN 직접 연결은 제한됩니다. Tailscale을 직접 활성화하면 사설망 권한에 따라 기기에 연결할 수 있습니다.
 - 네트워크 검사에는 현재 구성과 샘플링된 증거가 표시됩니다. 계정이 플랫폼 제한을 피할 것이라고 보장할 수 없으며 완전한 가상화 보안 감사를 대체하지 않습니다.
 
@@ -108,7 +121,7 @@ macOS와 서명된 Windows 버전은 선택한 프록시를 통해 업데이트�
 
 | 귀하의 작업 | 여기서 시작하세요 |
 |---|---|
-| macOS / Windows / Debian / Ubuntu 22.04 | [게스트 시스템 선택](https://claude-cage.com/docs/guest-systems/) |
+| Debian 13 | [Debian 환경](https://claude-cage.com/docs/guest-systems/) |
 | 네트워크 프록시 설치, 구성 및 첫 번째 프로젝트 열기 | [시작하기](docs/getting-started.md) |
 | 다운로드, 시작, 연결 및 로그인 문제 해결 | [FAQ 및 복구](docs/troubleshooting.md) |
 | 키보드 컨트롤, 모양, 데이터 지속성 및 종료 동작 알아보기 | [매일 사용](docs/getting-started.md#日常使用) |
@@ -117,9 +130,9 @@ macOS와 서명된 Windows 버전은 선택한 프록시를 통해 업데이트�
 
 이 프로젝트는 빠르게 발전하고 있습니다. 피드백을 공유하려면 커뮤니티 그룹에 가입하세요. 커뮤니티 관리자를 환영합니다.
 
-| QQ group · 273237690 | WeChat |
+| QQ group · 782087179 | WeChat |
 | :---: | :---: |
-| <a href="assets/community-qq.png"><img src="assets/community-qq.png" alt="QQ group · 273237690" width="240" /></a> | <a href="www/src/assets/community-wechat.png"><img src="www/src/assets/community-wechat.png" alt="WeChat" width="240" /></a> |
+| <a href="assets/community-qq.png"><img src="assets/community-qq.png" alt="QQ group · 782087179" width="240" /></a> | <a href="www/src/assets/community-wechat.png"><img src="www/src/assets/community-wechat.png" alt="WeChat" width="240" /></a> |
 
 [Telegram](https://t.me/claude_cage)
 

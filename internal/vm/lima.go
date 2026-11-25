@@ -22,6 +22,7 @@ import (
 	"github.com/coreos/go-semver/semver"
 	"github.com/mattn/go-isatty"
 	"github.com/sirupsen/logrus"
+	"github.com/sylvinus/agent-vm/internal/durable"
 	"github.com/sylvinus/agent-vm/internal/guestprofile"
 
 	"github.com/lima-vm/lima/v2/pkg/driver/external/server"
@@ -34,13 +35,13 @@ import (
 	"github.com/lima-vm/lima/v2/pkg/limatype/filenames"
 	"github.com/lima-vm/lima/v2/pkg/limayaml"
 	"github.com/lima-vm/lima/v2/pkg/networks/reconcile"
-	"github.com/lima-vm/lima/v2/pkg/osutil"
 	"github.com/lima-vm/lima/v2/pkg/sshutil"
 	"github.com/lima-vm/lima/v2/pkg/store"
 	"github.com/lima-vm/lima/v2/pkg/yqutil"
 	"github.com/sylvinus/agent-vm/internal/vmname"
 
 	"github.com/sylvinus/agent-vm/internal/cage"
+	"github.com/sylvinus/agent-vm/internal/host"
 	"github.com/sylvinus/agent-vm/internal/limaembed"
 	"github.com/sylvinus/agent-vm/internal/paths"
 )
@@ -97,6 +98,31 @@ func UserLimaHome() string {
 		return os.Getenv("LIMA_HOME")
 	}
 	return userLimaHome
+}
+
+// ChildEnv is this process's environment for another agent-vm process. The
+// LIMA_HOME NewLima set is for Lima's packages here only: a child would take
+// it for the user's own and refuse to share it with its VMs.
+func ChildEnv() []string {
+	limaHomeMu.Lock()
+	set, user := limaHomeSet, userLimaHome
+	limaHomeMu.Unlock()
+	env := os.Environ()
+	if set == "" {
+		return env
+	}
+	kept := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		key, _, _ := strings.Cut(entry, "=")
+		if key == "LIMA_HOME" || runtime.GOOS == "windows" && strings.EqualFold(key, "LIMA_HOME") {
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	if user != "" {
+		kept = append(kept, "LIMA_HOME="+user)
+	}
+	return kept
 }
 
 // prepare writes the embedded share once, and points Lima's template store
@@ -187,6 +213,23 @@ func (l *Lima) inspect(ctx context.Context, name string) (*limatype.Instance, er
 	return inst, err
 }
 
+// InstanceIn is the VM name of the Lima home home. Unlike NewLima it puts
+// LIMA_HOME back: a process that only looks at VMs must not pass home to the
+// programs it starts next, which take it for the user's own Lima home.
+func InstanceIn(ctx context.Context, home, name string) (*Instance, error) {
+	limaHomeMu.Lock()
+	defer limaHomeMu.Unlock()
+	var out *Instance
+	err := withLimaHome(home, func() error {
+		inst, err := (&Lima{}).inspect(ctx, name)
+		if err == nil {
+			out = fromLima(inst)
+		}
+		return err
+	})
+	return out, err
+}
+
 func fromLima(inst *limatype.Instance) *Instance {
 	out := &Instance{
 		Name:         inst.Name,
@@ -246,12 +289,6 @@ func fromLima(inst *limatype.Instance) *Instance {
 // exprs are the yq expressions of s, as limactl's edit flags make them.
 func exprs(s Settings) ([]string, error) {
 	var e []string
-	if s.macOSInstaller != nil {
-		e = append(e, fmt.Sprintf(".vmOpts.qemu.macOS.installer = %t", *s.macOSInstaller))
-	}
-	if s.macOSTimezone != "" {
-		e = append(e, ".timezone = "+strconv.Quote(s.macOSTimezone))
-	}
 	if s.CPUs > 0 {
 		e = append(e, fmt.Sprintf(".cpus = %d", s.CPUs))
 	}
@@ -272,7 +309,9 @@ func exprs(s Settings) ([]string, error) {
 		// default 127.0.0.1 leaves the listeners on 0.0.0.0 forwarded.
 		// Last, after the VM's own rules, which win (Lima takes the first
 		// rule that matches); one made earlier is replaced, not repeated.
-		e = append(e, fmt.Sprintf(`.portForwards = ((.portForwards // []) | map(select(((.guestPortRange // []) | join("-")) != "%d-%d"))) + [{"guestIP": "0.0.0.0", "guestIPMustBeZero": false, "guestPortRange": [%d, %d], "proto": "any", "ignore": true}]`, ephemeralPorts[0], ephemeralPorts[1], ephemeralPorts[0], ephemeralPorts[1]))
+		for _, ports := range append([][2]int{ephemeralPorts, hostToolsPort}, guestOnlyPorts...) {
+			e = append(e, fmt.Sprintf(`.portForwards = ((.portForwards // []) | map(select(((.guestPortRange // []) | join("-")) != "%d-%d"))) + [{"guestIP": "0.0.0.0", "guestIPMustBeZero": false, "guestPortRange": [%d, %d], "proto": "any", "ignore": true}]`, ports[0], ports[1], ports[0], ports[1]))
+		}
 	}
 	if s.MountType != nil {
 		if *s.MountType == "" {
@@ -299,7 +338,33 @@ func exprs(s Settings) ([]string, error) {
 	return e, nil
 }
 
+// ValidateName reports whether Lima can create an instance with this name.
+func (l *Lima) ValidateName(name string) error {
+	if err := dirnames.ValidateInstName(name); err != nil {
+		if strings.Contains(err.Error(), "greater than maximum length") {
+			return fmt.Errorf("%w: %v", ErrNameTooLong, err)
+		}
+		return err
+	}
+	home, err := dirnames.LimaDir()
+	if err != nil {
+		return err
+	}
+	if stable := os.Getenv("CAGE_LOGICAL_LIMA_HOME"); stable == "" || filepath.Clean(home) != filepath.Clean(stable) {
+		if physical, physErr := cage.StoragePhysicalPath(home); physErr == nil {
+			home = physical
+		}
+	}
+	if err := cage.ValidateLimaSocketPath(filepath.Join(home, name)); err != nil {
+		return fmt.Errorf("%w: %w", ErrNameTooLong, err)
+	}
+	return nil
+}
+
 func (l *Lima) Create(ctx context.Context, name, template string, s Settings, log io.Writer) error {
+	if err := l.ValidateName(name); err != nil {
+		return err
+	}
 	if _, err := l.prepare(); err != nil {
 		return err
 	}
@@ -352,19 +417,11 @@ func (l *Lima) Create(ctx context.Context, name, template string, s Settings, lo
 				e = append(e, ".images = "+string(images))
 				// cloud-init rewrites Debian's mirror list after bootcmd.
 				// Configure it immediately before Lima installs dependencies.
-				e = append(e, `.provision += [{"mode": "dependency", "script": `+strconv.Quote(cage.DebianPrepareScript)+`}]`)
+				e = append(e, `.provision += [{"mode": "dependency", "script": `+strconv.Quote(cage.DebianPrepareScriptFor(os.Getenv(cage.DebianMirrorEnv)))+`}]`)
 			}
 			tz, _ := json.Marshal(cfg.Timezone)
 			e = append(e, ".propagateProxyEnv = false", `.env = {"http_proxy":"","https_proxy":"","ftp_proxy":"","no_proxy":"","HTTP_PROXY":"","HTTPS_PROXY":"","FTP_PROXY":"","NO_PROXY":"","ALL_PROXY":"","all_proxy":""}`, ".timezone = "+string(tz))
-			if tmpl.Config.OS != nil && *tmpl.Config.OS == limatype.DARWIN {
-				uid := 501
-				if tmpl.Config.User.UID != nil && *tmpl.Config.User.UID >= 501 && *tmpl.Config.User.UID <= 599 {
-					uid = int(*tmpl.Config.User.UID)
-				}
-				e = append(e, `.user.name = "cageprovision"`, `.user.home = "/Users/cageprovision"`, `.user.comment = "Cage Provisioning"`, fmt.Sprintf(".user.uid = %d", uid), `.video.display = "offscreen"`)
-			} else {
-				e = append(e, `.user.name = `+strconv.Quote(profile.WorkUser()), `.user.home = `+strconv.Quote(profile.WorkHomePath()), `.user.comment = ""`, ".user.uid = 1000")
-			}
+			e = append(e, `.user.name = `+strconv.Quote(profile.WorkUser()), `.user.home = `+strconv.Quote(profile.WorkHomePath()), `.user.comment = ""`, ".user.uid = 1000")
 		}
 		data, err := json.Marshal(identity)
 		if err != nil {
@@ -375,6 +432,15 @@ func (l *Lima) Create(ctx context.Context, name, template string, s Settings, lo
 			return err
 		}
 		_, err = instance.Create(ctx, name, tmpl.Bytes, false)
+		if err != nil {
+			// Lima's failed Create cleanup calls os.RemoveAll, which on Windows
+			// leaves behind 0o444 cloud-config.yaml/lima-version without lima.yaml.
+			if dir, dirErr := dirnames.InstanceDir(name); dirErr == nil {
+				if _, yamlErr := os.Lstat(filepath.Join(dir, filenames.LimaYAML)); errors.Is(yamlErr, os.ErrNotExist) {
+					_ = host.RemoveAllWritable(dir)
+				}
+			}
+		}
 		return err
 	})
 }
@@ -382,16 +448,16 @@ func (l *Lima) Create(ctx context.Context, name, template string, s Settings, lo
 // All three locations must supply the exact release pinned by the embedded
 // template. In particular, never accept an unpinned daily image on fallback.
 func cageDebianImages(images []limatype.Image) ([]byte, error) {
-	const upstream = "https://cloud.debian.org/images/cloud/"
+	upstream := debianImageMirrors[0].base
 	var candidates []limatype.Image
 	for _, img := range images {
 		suffix, ok := strings.CutPrefix(img.Location, upstream)
 		if !ok || img.Variant != "genericcloud" || img.Digest.Validate() != nil || img.Digest.Algorithm() != "sha512" {
 			continue
 		}
-		for _, base := range []string{upstream, "https://mirrors.nju.edu.cn/debian-cdimage/cloud/", "https://mirrors.ustc.edu.cn/debian-cdimage/cloud/"} {
+		for _, mirror := range debianImageMirrors {
 			candidate := img
-			candidate.Location = base + suffix
+			candidate.Location = mirror.base + suffix
 			candidates = append(candidates, candidate)
 		}
 	}
@@ -406,15 +472,8 @@ func (l *Lima) Clone(ctx context.Context, from, to string) error {
 	if err != nil {
 		return err
 	}
-	dir, err := dirnames.InstanceDir(to)
-	switch {
-	case err != nil && strings.Contains(err.Error(), "maximum length"):
-		return fmt.Errorf("%w: %v", ErrNameTooLong, err)
-	case err != nil:
+	if err := l.ValidateName(to); err != nil {
 		return err
-	}
-	if sock := filepath.Join(dir, filenames.LongestSock); len(sock) >= osutil.UnixPathMax {
-		return fmt.Errorf("%w: its sockets in %s would need %d characters, at most %d", ErrNameTooLong, filepath.Dir(dir), len(sock), osutil.UnixPathMax-1)
 	}
 	identity, err := guestidentity.New()
 	if err != nil {
@@ -431,6 +490,104 @@ func (l *Lima) Clone(ctx context.Context, from, to string) error {
 	}
 	_, err = instance.CloneWithIdentity(ctx, inst, to, identity)
 	return err
+}
+
+// IdentityInfo describes the current persisted hardware/machine identity of a
+// Lima instance without starting it.
+type IdentityInfo struct {
+	VMType          string
+	Identity        *guestidentity.Identity
+	HasVZIdentifier bool
+}
+
+// CurrentIdentity reads the saved guest identity and hypervisor type for name.
+func (l *Lima) CurrentIdentity(ctx context.Context, name string) (IdentityInfo, error) {
+	inst, err := l.inspect(ctx, name)
+	if err != nil {
+		return IdentityInfo{}, err
+	}
+	info := IdentityInfo{
+		VMType:   inst.VMType,
+		Identity: inst.Config.GuestIdentity,
+	}
+	if _, statErr := os.Stat(filepath.Join(inst.Dir, filenames.VzIdentifier)); statErr == nil {
+		info.HasVZIdentifier = true
+	}
+	return info, nil
+}
+
+// RotateIdentity replaces the persisted guestIdentity of a stopped Lima VM,
+// removes any saved Apple Virtualization machine identifier so a fresh one is
+// created on next boot, and clears any stale cidata.iso.
+func (l *Lima) RotateIdentity(ctx context.Context, name string, next *guestidentity.Identity) (previous *guestidentity.Identity, vzReset bool, err error) {
+	if err := next.Validate(); err != nil {
+		return nil, false, err
+	}
+	inst, err := l.inspect(ctx, name)
+	if err != nil {
+		return nil, false, err
+	}
+	if inst.Status == limatype.StatusRunning {
+		return nil, false, fmt.Errorf("cannot rotate identity of the running VM %s", name)
+	}
+	previous = inst.Config.GuestIdentity
+	path := filepath.Join(inst.Dir, filenames.LimaYAML)
+	old, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false, err
+	}
+	encoded, err := json.Marshal(next)
+	if err != nil {
+		return nil, false, err
+	}
+	updated, err := yqutil.EvaluateExpression(ctx, ".guestIdentity = "+string(encoded), old)
+	if err != nil {
+		return nil, false, err
+	}
+	cfg, err := limayaml.LoadWithWarnings(ctx, updated, path)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := driverutil.ResolveVMType(cfg); err != nil {
+		return nil, false, err
+	}
+	if err := limayaml.Validate(cfg, false); err != nil {
+		return nil, false, err
+	}
+	f, err := os.CreateTemp(inst.Dir, filenames.LimaYAML+".*.tmp")
+	if err != nil {
+		return nil, false, err
+	}
+	tempPath := f.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tempPath)
+		}
+	}()
+	if _, err = f.Write(updated); err != nil {
+		_ = f.Close()
+		return nil, false, err
+	}
+	if err = f.Sync(); err != nil {
+		_ = f.Close()
+		return nil, false, err
+	}
+	if err = f.Close(); err != nil {
+		return nil, false, err
+	}
+	if err = os.Rename(tempPath, path); err != nil {
+		return nil, false, err
+	}
+	cleanup = false
+	vzPath := filepath.Join(inst.Dir, filenames.VzIdentifier)
+	if err := os.Remove(vzPath); err == nil {
+		vzReset = true
+	} else if !os.IsNotExist(err) {
+		return previous, false, err
+	}
+	_ = os.Remove(filepath.Join(inst.Dir, filenames.CIDataISO))
+	return previous, vzReset, nil
 }
 
 // Edit applies s as `limactl edit` does: the same checks, and nothing is
@@ -497,6 +654,9 @@ func (l *Lima) Edit(ctx context.Context, name string, s Settings) error {
 	}
 	tmp := f.Name()
 	_, err = f.Write(y)
+	if err == nil {
+		err = f.Sync()
+	}
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
@@ -508,8 +668,9 @@ func (l *Lima) Edit(ctx context.Context, name string, s Settings) error {
 	}
 	if err != nil {
 		os.Remove(tmp)
+		return err
 	}
-	return err
+	return durable.SyncDir(inst.Dir)
 }
 
 // sharesKept fails unless Lima reads every share as written: it expands Go
@@ -539,24 +700,29 @@ func sharesKept(want []Mount, got []limatype.Mount) error {
 var logMu sync.Mutex
 
 // withLog runs fn with Lima's logrus output going to log.
-// The installer runs with a bounded guest memory so the host keeps its page
-// cache for the disk images; 8 GiB is twice Apple's minimum.
-const macOSInstallerMemoryGiB = 8
-
-func macOSInstallerActive(config *limatype.LimaYAML) bool {
-	if config == nil || config.OS == nil || *config.OS != limatype.DARWIN {
-		return false
-	}
-	var options struct {
-		MacOS struct {
-			Installer bool `yaml:"installer"`
-		} `yaml:"macOS"`
-	}
-	return limayaml.Convert(config.VMOpts["qemu"], &options, "vmOpts.qemu") == nil && options.MacOS.Installer
-}
-
 // Until the guest's SSH server is up, the hostagent reports every refused
 // forwarding attempt. They remain in ha.stderr.log but are not progress.
+const (
+	// FirstBootIdleWait is how long a first boot may go without any new
+	// hostagent event or cloud-init output line.
+	FirstBootIdleWait = 10 * time.Minute
+	// FirstBootMaxWait bounds a first boot that keeps making progress.
+	FirstBootMaxWait = 2 * time.Hour
+)
+
+type firstBootKey struct{}
+
+// WithFirstBoot marks a start as the base system's first boot, which waits
+// for cloud-init with a progress-based timeout instead of the fixed one.
+func WithFirstBoot(ctx context.Context) context.Context {
+	return context.WithValue(ctx, firstBootKey{}, true)
+}
+
+func firstBoot(ctx context.Context) bool {
+	v, _ := ctx.Value(firstBootKey{}).(bool)
+	return v
+}
+
 type quietBootLog struct{ io.Writer }
 
 func (q quietBootLog) Write(p []byte) (int, error) {
@@ -599,28 +765,11 @@ func (l *Lima) Start(ctx context.Context, name string, log io.Writer) error {
 			return loadErr
 		}
 		settings.MemoryGiB, settings.CPUs, err = allocation.Limits()
-		if *inst.Config.OS == limatype.DARWIN && err == nil {
-			cfg, loadErr := cage.Load(configPath)
-			if loadErr != nil {
-				return loadErr
-			}
-			settings.macOSTimezone = cfg.Timezone
-			requirements, requirementErr := ReadMacOSResourceRequirements(inst.Dir)
-			if requirementErr != nil {
-				return requirementErr
-			}
-			settings.MemoryGiB, settings.CPUs, err = requirements.Limits(allocation)
-			if err == nil {
-				err = saveMacOSResourceRequirements(inst.Dir, requirements)
-			}
-			// Apple's installer is I/O bound. A large guest only competes with
-			// the host page cache; the user's allocation applies after install.
-			if err == nil && macOSInstallerActive(inst.Config) && settings.MemoryGiB > macOSInstallerMemoryGiB {
-				settings.MemoryGiB = macOSInstallerMemoryGiB
-			}
-		}
 		if err != nil {
 			return err
+		}
+		if !allocation.Automatic && allocation.DiskGiB > 0 && int64(allocation.DiskGiB)<<30 > inst.Disk {
+			settings.DiskGiB = allocation.DiskGiB
 		}
 	}
 	if err := l.Edit(ctx, name, settings); err != nil {
@@ -636,9 +785,8 @@ func (l *Lima) Start(ctx context.Context, name string, log io.Writer) error {
 		return err
 	}
 	var guestAgent string
-	// Lima always needs the Darwin helper for first boot. Windows and FreeBSD
-	// have no guest agent, and Linux plain mode works without one.
-	if *inst.Config.OS == limatype.DARWIN || (*inst.Config.OS == limatype.LINUX && !*inst.Config.Plain) {
+	// Linux plain mode works without a guest agent.
+	if *inst.Config.OS == limatype.LINUX && !*inst.Config.Plain {
 		guestAgent, err = share.GuestAgent(*inst.Config.OS, *inst.Config.Arch)
 		if err != nil {
 			return err
@@ -648,8 +796,19 @@ func (l *Lima) Start(ctx context.Context, name string, log io.Writer) error {
 		if err := reconcile.Reconcile(ctx, name); err != nil {
 			return err
 		}
+		// Lima writes cloud-config.yaml with 0o444 (Windows DOS ReadOnly); make it
+		// writable before hostagent regenerates it on restart.
+		_ = host.MakeTreeWritable(filepath.Join(inst.Dir, filenames.CloudConfig))
 		started := time.Now()
-		return vmStartError(instance.StartWithPaths(ctx, inst, false, false, "", guestAgent), inst.Dir, started)
+		progress := firstBoot(ctx)
+		if progress {
+			// A first boot installs packages through the selected proxy and
+			// may take long on a slow link. Follow cloud-init output and fail
+			// only when it stalls, within an overall bound (#281).
+			ctx = instance.WithWatchHostAgentTimeout(ctx, FirstBootMaxWait)
+			ctx = instance.WithWatchHostAgentIdleTimeout(ctx, FirstBootIdleWait)
+		}
+		return vmStartError(instance.StartWithPaths(ctx, inst, false, progress, "", guestAgent), inst.Dir, started)
 	})
 }
 
@@ -689,6 +848,9 @@ func (l *Lima) Delete(ctx context.Context, name string) error {
 				return err
 			}
 		}
+		// Clear read-only attributes (e.g. Windows 0o444 cloud-config.yaml/lima-version)
+		// before Lima's instance.Delete calls os.RemoveAll.
+		_ = host.MakeTreeWritable(inst.Dir)
 		return errors.Join(instance.Delete(ctx, inst, true), reconcile.Reconcile(ctx, ""))
 	})
 }

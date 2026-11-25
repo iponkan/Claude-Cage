@@ -3,6 +3,8 @@
 #   make              _output/bin/agent-vm, with the guest agent and templates
 #   make install      build it, then link it onto the PATH (AGENT_VM_BIN_DIR
 #                     to choose where; ~/.local/bin by default)
+#   make cage         _output/bin/cage, the Claude Cage backend
+#   make cage-core    the bundled proxy core that 'make cage' leaves out
 #   make limactl      Lima's own limactl from third_party/, for debugging
 #   make test         the Go tests
 #   make check-windows      the Windows build and tests compile and vet, from any OS
@@ -54,12 +56,28 @@ cage: cage-ui assets tailnet-assets
 ifeq ($(GOOS),darwin)
 	codesign -f --entitlements third_party/lima/vz.entitlements -s - _output/bin/cage
 endif
+	@test -f _output/bin/mihomo$(EXE) || test -f _output/proxy-core/mihomo$(EXE) || \
+	  echo "note: no bundled proxy core (mihomo) for _output/bin/cage; run 'make cage-core' before importing proxies" >&2
+
+# The bundled Mihomo core, which cage finds in _output/proxy-core/ beside
+# _output/bin/. Release scripts fetch it themselves; this is for running a
+# plain 'make cage' build.
+cage-core:
+ifeq ($(GOOS),darwin)
+	CAGE_CORE_ARCH=$(GOARCH) bash scripts/fetch-proxy-core.sh
+else ifeq ($(GOOS)-$(GOARCH),linux-amd64)
+	bash scripts/fetch-linux-proxy-core.sh
+	mkdir -p _output/proxy-core
+	install -m 755 _output/linux-deps/mihomo _output/proxy-core/mihomo
+else
+	@echo "make cage-core supports macOS and Linux amd64; on Windows use scripts/build-windows.ps1" >&2; exit 1
+endif
 
 cage-ui:
 	npm --prefix ui ci --no-audit --no-fund
 	npm run --prefix ui build
 
-.PHONY: cage cage-ui cage-windows package-windows cage-linux package-linux check-linux
+.PHONY: cage cage-ui cage-core cage-windows package-windows cage-linux package-linux check-linux
 cage-linux:
 	bash scripts/build-linux.sh
 
@@ -102,19 +120,15 @@ assets:
 		-ldflags "-s -w -X github.com/lima-vm/lima/v2/pkg/version.Version=$(LIMA_VERSION)" \
 		-o $(ASSETS)/lima-guestagent.Linux-$(GUEST_ARCH) github.com/lima-vm/lima/v2/cmd/lima-guestagent
 	gzip -9 -n -f $(ASSETS)/lima-guestagent.Linux-$(GUEST_ARCH)
-ifeq ($(GOOS),darwin)
-	mkdir -p $(ASSETS)/Darwin
-	CGO_ENABLED=0 GOOS=darwin GOARCH=$(GOARCH) $(GO) build -trimpath -tags $(TAGS) \
-		-ldflags "-s -w -X github.com/lima-vm/lima/v2/pkg/version.Version=$(LIMA_VERSION)" \
-		-o $(ASSETS)/Darwin/lima-guestagent.Darwin-$(GUEST_ARCH) github.com/lima-vm/lima/v2/cmd/lima-guestagent
-	gzip -9 -n -f $(ASSETS)/Darwin/lima-guestagent.Darwin-$(GUEST_ARCH)
-endif
 	rm -rf $(ASSETS)/templates && cp -R third_party/lima/templates $(ASSETS)/templates
 
 test: test-go
 
 test-go:
 	$(GO) test -tags $(TAGS) . ./cmd/... ./internal/...
+ifeq ($(GOOS)-$(CGO_ENABLED),darwin-1)
+	$(GO) test github.com/Code-Hex/vz/v3
+endif
 	cd tools/tailnet && GOFLAGS= $(GO) test ./...
 
 # The Windows build and its tests compile and vet, from any OS. The Windows

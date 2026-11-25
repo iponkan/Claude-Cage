@@ -19,8 +19,15 @@ import (
 )
 
 // BootstrapClient serves only explicitly host-routed subscription requests.
-func BootstrapClient() *http.Client {
-	return &http.Client{Transport: subscriptionHostTransport{hostproxy.NewTransport(), BootstrapDNSURLs()}, Timeout: 30 * time.Second, CheckRedirect: func(r *http.Request, via []*http.Request) error {
+func BootstrapClient() *http.Client { return BootstrapClientWith(BootstrapDNSURLs()) }
+
+// BootstrapClientWith downloads over the host network, resolving names with
+// the given numeric DoH endpoints.
+func BootstrapClientWith(servers []string) *http.Client {
+	if len(servers) == 0 {
+		servers = BootstrapDNSURLs()
+	}
+	return &http.Client{Transport: subscriptionHostTransport{hostproxy.NewTransport(), servers}, Timeout: 30 * time.Second, CheckRedirect: func(r *http.Request, via []*http.Request) error {
 		if len(via) >= 3 || r.URL.Scheme != "https" || r.URL.User != nil {
 			return errors.New("订阅重定向被拒绝")
 		}
@@ -171,6 +178,10 @@ func queryInfrastructureDNS(ctx context.Context, client *http.Client, server str
 	}
 	return netip.Addr{}, errors.New("代理基础设施域名没有可用公网 IPv4")
 }
+// subscriptionUserAgent matches the bundled Mihomo core version without
+// exposing any product-specific identifier to subscription providers.
+const subscriptionUserAgent = "clash.meta/v1.19.33"
+
 func Fetch(ctx context.Context, client *http.Client, rawURL string) ([]byte, string, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Fragment != "" {
@@ -180,7 +191,7 @@ func Fetch(ctx context.Context, client *http.Client, rawURL string) ([]byte, str
 	if err != nil {
 		return nil, "", errors.New("订阅网址无效")
 	}
-	req.Header.Set("User-Agent", "clash.meta/Cage")
+	req.Header.Set("User-Agent", subscriptionUserAgent)
 	res, err := client.Do(req)
 	if err != nil {
 		return nil, "", errors.New("订阅下载失败，请检查下载路径和服务地址")

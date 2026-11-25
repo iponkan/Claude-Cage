@@ -5,14 +5,13 @@
 | 标识 | Linux 容器 | Lima / QEMU | Lima / Apple Virtualization |
 | --- | --- | --- | --- |
 | 客机主机名 | 常见 PC 命名样式或真实型号简称 + 随机后缀，最长 15 字符 | 同左 | 同左，由客机初始化配置应用 |
-| UUID | 每个容器独立生成 | 通过 `-uuid` 传给 QEMU | 平台标识仍由 Apple 框架生成并持久化 |
-| `/etc/machine-id` | 空白镜像首次启动时，systemd 使用 `container_uuid` 初始化 | 不修改磁盘中已有的 machine-id | 不适用 macOS；不修改 Linux 磁盘中已有的 machine-id |
+| UUID | 每个容器独立生成 | 通过 `-uuid` 传给 QEMU | 平台标识仍由 Apple 框架生成并持久化（换机时可清除 `vz-identifier` 以重新生成） |
+| SMBIOS Type 1/2/3 序列号 | 无独立虚拟硬件层 | 为每个环境生成独立随机 12 位大写字母数字序列号，通过 `-smbios` 传入 | Apple Virtualization 框架不开放自定义 SMBIOS |
+| `/etc/machine-id` | 空白镜像首次启动时，systemd 使用 `container_uuid` 初始化 | 新建或原地换机时写入独立 32 位标识 | 同左 |
 | 默认客机网卡 MAC | 随机本地单播地址 | 同左，客机配置与 DHCP 租约同步 | 同左 |
 | 独立虚拟网络的网关 MAC | 独立随机本地单播地址 | 同左 | 同左 |
 
 首次设置中可以手动填写主机名，留空则随机生成。Linux 账户、主目录、初始尺寸、控制扩展及浏览器图形后端也可在创建时配置，音频输出名称从真实产品型号库中自动选择，见[客机创建配置](guest-profile.md)。浏览器保留实际 UA 与 Client Hints；配置随环境保存，重启不重新抽取。环境检测可核对配置和实际渲染能力，未观测到的硬件或应用内部数据不会标为通过。
-
-Windows 新系统安装使用选定的计算机名；独立运行正式版或评估版的 PowerShell 创建脚本时可通过 `-ComputerName` 指定，不指定则使用 `*`，由 Windows Setup 生成。用户导入的已有 Windows 系统不改名。Windows 原生 Hyper-V 的硬件标识仍由 Hyper-V 管理。
 
 主机名没有 `claude-cage-`、`cage-` 或 `lima-` 固定前缀，也不包含项目目录、宿主机名或路径哈希。MAC 的第一个字节只保留本地单播位约束，不使用固定三字节前缀。
 
@@ -31,7 +30,7 @@ Windows 新系统安装使用选定的计算机名；独立运行正式版或评
 
 离线库包含 **1,593 条真实型号记录、1,181 个不同简称**：联想 506 条、戴尔 499 条、惠普 551 条、华擎主板 37 条。记录来自厂商公开型号/驱动部署目录，保留完整型号、厂商和来源校验信息。联想目录中的 `Type` 型号变体保留在原始型号列，生成简称时去掉这些尾部 SKU 字段，以保留更容易识别的型号和代数。
 
-简称是本项目从真实型号整理出的命名素材，不声称是厂家出厂主机名，也不代表实际 SMBIOS、主板、CPU 或客机系统。Windows 的 `DESKTOP-` 默认形态也可出现在笔记本上；这些权重用于混合样式，不代表市场份额。Linux 容器与 Lima 客机共享该生成器，Windows 原生安装仍使用 Setup 自身的命名规则。
+简称是本项目从真实型号整理出的命名素材，不声称是厂家出厂主机名，也不代表实际 SMBIOS、主板、CPU 或客机系统。Windows 的 `DESKTOP-` 默认形态也可出现在笔记本上；这些权重用于混合样式，不代表市场份额。Linux 容器与 Lima 虚拟机共享该生成器。
 
 数据随程序嵌入，创建时不联网、不查询宿主硬件、不安装驱动。更新方式与来源见 `docs/hostname-catalog.md`、`hostname-sources.json` 和 `scripts/update-hostname-catalog.py`。后者只从本地 XML/JSON 编译数据，输出可重复构建。
 
@@ -40,7 +39,12 @@ Windows 新系统安装使用选定的计算机名；独立运行正式版或评
 - **新建**：每次实际创建环境时生成新身份。容器保存到自身的 `cn.cage.guest-identity` 标签；Lima 保存到实例 `lima.yaml` 的 `guestIdentity` 字段。
 - **重连、重启、资源修改**：复用原有身份，避免无故变化影响 DHCP、系统服务与持久化数据。
 - **克隆**：目标实例生成新的 UUID 和 MAC，包括从没有 `guestIdentity` 字段的旧模板克隆。Cage 环境内派生工作实例时使用已选定的主机名；不使用 Cage 创建配置的普通克隆仍生成新主机名。源实例保持原样。
-- **旧环境**：没有身份字段或标签的实例沿用旧行为；不自动重建、改名或清除数据。需要新身份时创建新的环境。
+- **旧环境**：没有身份字段或标签的实例沿用旧行为；不自动重建、改名或清除数据。需要新身份时可通过「设置 → 环境与恢复 → 一键换机与指纹重置」执行原地快速换机或彻底换新机，或创建独立的新环境。
+- **一键换机与指纹重置**：
+  - **快速换机（原地重置）**：保留系统盘、Linux 账户与已装开发工具链，轮换主机名、UUID、MAC、网关 MAC、（QEMU）SMBIOS 序列号、（macOS VZ）`vz-identifier`、`/etc/machine-id`、SSH 主机密钥、音频设备、显示尺寸与浏览器控制扩展 ID，并按用户勾选（默认全选、支持逐项取消）清理浏览器资料、Claude Code、Claude Desktop、编辑器状态与终端历史。
+  - **彻底换新机（模板重建）**：使用全新的 `guest-profile.json`（支持折叠展开自定义名称与设备配置）从本地缓存的基础镜像重建全新客机，连同 Linux 账户名、主目录、系统盘与全部硬件/系统身份一并更新。
+  - **个人数据保护与回滚**：宿主机上的项目文件夹、代理订阅/节点配置和密码保险箱永久保留，绝不触碰。旧环境默认移入受控归档（L3）或恢复批次（L2）支持一键回滚与手动删除释放空间；勾选「彻底清理旧数据（不可恢复）」时需二次确认，且严格遵循“先建新、验证就绪、再删旧”的事务顺序，构建失败自动回滚到原环境。
+  - 换机后建议同步在「设置 → 网络与代理」切换出口节点，避免新旧环境共用同一出口 IP。
 - **坏数据**：已有身份字段格式无效时返回错误，不回退到共享固定值。随机源失败时中止创建。
 
 Linux 容器基础镜像必须保持 `/etc/machine-id` 为空，且不得保留独立的 D-Bus machine-id；仓库的镜像构建脚本已有身份清理检查。`container_uuid` 只负责新容器首次启动，不覆盖用户后来修改的机器身份。
@@ -53,4 +57,4 @@ Linux 容器基础镜像必须保持 `/etc/machine-id` 为空，且不得保留�
 
 手工验收时，在两个全新环境内分别检查主机名、默认网卡 MAC、网关邻居项；Linux 容器还应检查 `/etc/machine-id`。同一环境完整停止再启动后重复检查，确认身份稳定。不要在 Issue 或测试报告中附带认证文件、私钥或原始日志。
 
-参考：[systemd 容器接口](https://systemd.io/CONTAINER_INTERFACE/)、[Windows ComputerName](https://learn.microsoft.com/en-us/windows-hardware/customize/desktop/unattend/microsoft-windows-shell-setup-computername)。
+参考：[systemd 容器接口](https://systemd.io/CONTAINER_INTERFACE/)。

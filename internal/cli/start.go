@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"github.com/sylvinus/agent-vm/internal/env"
 	"github.com/sylvinus/agent-vm/internal/guard"
 	"github.com/sylvinus/agent-vm/internal/host"
+	"github.com/sylvinus/agent-vm/internal/hostimage"
 	"github.com/sylvinus/agent-vm/internal/mounts"
 	"github.com/sylvinus/agent-vm/internal/netguard"
 	"github.com/sylvinus/agent-vm/internal/paths"
@@ -321,6 +323,12 @@ func (s *start) ensureRunning() error {
 
 func (s *start) ensureRunningLocked() error {
 	o := &s.opts
+	// An environment created from a system that is no longer run stays as it
+	// is: starting it would apply this version's setup to the wrong system.
+	if system := hostimage.AbandonedEnvironment(string(s.state)); system != "" {
+		s.warnf("Error: %v", &hostimage.AbandonedSystemError{System: system})
+		return errStop
+	}
 	if o.Scratch && (o.Reset || o.ReadOnly) {
 		s.warnf("Error: --scratch makes a new VM that shares nothing: --reset and --readonly do not go with it.")
 		return errStop
@@ -383,7 +391,7 @@ func (s *start) ensureRunningLocked() error {
 	// Under the VM's lock: no other run is making it now.
 	if d := filepath.Join(LimaHome(s.state), s.name); isDirNoYAML(d) {
 		s.warnf("Detected partial VM state at %s (no lima.yaml): cleaning up.", d)
-		if err := os.RemoveAll(d); err != nil {
+		if err := host.RemoveAllWritable(d); err != nil {
 			s.warnf("Error: could not remove %s:\n%v", d, err)
 			return errStop
 		}
@@ -514,7 +522,7 @@ func (s *start) ensureRunningLocked() error {
 		}
 	}
 	if s.staleState(s.name) == "1" {
-		s.warnf("Warning: Base VM has been updated since this VM was cloned. Use --reset to re-clone from the new base.")
+		s.warnf("%s", staleBaseHint(false))
 	}
 
 	// The shares Lima has, against those asked: a stopped VM is changed
@@ -633,8 +641,10 @@ func isDirNoYAML(d string) bool {
 	if fi, err := os.Stat(d); err != nil || !fi.IsDir() {
 		return false
 	}
+	// Only a definite absence is partial state; a permission or I/O error says
+	// nothing about the disk the folder holds.
 	_, err := os.Stat(filepath.Join(d, "lima.yaml"))
-	return err != nil
+	return errors.Is(err, fs.ErrNotExist)
 }
 
 // boot starts the stopped VM, its config checked first.

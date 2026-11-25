@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <math.h>
 #include "native-input.h"
+#include "media-plugins.h"
 
 #ifndef CAGE_VERSION
 #define CAGE_VERSION "development"
@@ -23,13 +24,18 @@
 typedef struct {
     GtkApplication *application;
     GtkWidget *window, *stack, *status, *retry, *existing, *complete;
+    GMenu *menu;
+    JsonObject *messages;
     WebKitWebView *web;
+    WebKitWebContext *web_context;
     WebKitUserContentManager *content;
+    GdkRGBA background_color;
     char *backend, *profile, *token, *smoke_output, *web_data, *web_cache;
     const char *storage_phase, *storage_marker;
     int port, result;
-    gboolean bootstrapping, needs_update, ready, picker_open, smoke_started, navigation_failed;
-    gboolean initial_dark;
+    guint backend_commands;
+    gboolean bootstrapping, needs_update, ready, picker_open, smoke_started, smoke_finishing, navigation_failed;
+    gboolean initial_dark, media_plugins_isolated, dmabuf_default_set, software_fallback, has_background_color, quit_pending;
 } Cage;
 static Cage app;
 typedef struct { GPtrArray *paths; gint64 expires; } FileSelection;
@@ -40,6 +46,7 @@ static gboolean clipboard_watching = FALSE;
 typedef struct { GPtrArray *paths; gboolean pending, releasing; } ClipboardCopy;
 static GHashTable *clipboard_copies;
 static GPtrArray *clipboard_readers;
+static GPtrArray *clipboard_sends;
 static gboolean clipboard_cache_loaded = FALSE, clipboard_cache_collecting = FALSE;
 static void clipboard_cache_watch(void);
 static void clipboard_cache_ignored(JsonObject *object, const GError *error, gpointer data);
@@ -56,6 +63,7 @@ static guint64 clipboard_current_revision(void) {
 }
 static void bootstrap(const char *option);
 static void show_error(const char *message);
+static void update_menu(void);
 
 typedef void (*BackendCallback)(JsonObject *, const GError *, gpointer);
 typedef struct {
@@ -71,6 +79,35 @@ static const char *text_member(JsonObject *object, const char *name) {
     JsonNode *node = object ? json_object_get_member(object, name) : NULL;
     return node && JSON_NODE_HOLDS_VALUE(node) && json_node_get_value_type(node) == G_TYPE_STRING
         ? json_node_get_string(node) : "";
+}
+static const char *ui_text(const char *source) {
+    const char *message = text_member(app.messages, source);
+    return *message ? message : source;
+}
+/* Translations are whole sentences; only the {0} detail is inserted, so word order, spacing and punctuation stay per-language. */
+static char *ui_format(const char *source, const char *detail) {
+    const char *text = ui_text(source);
+    const char *slot = strstr(text, "{0}");
+    return slot ? g_strdup_printf("%.*s%s%s", (int)(slot - text), text, detail, slot + 3) : g_strdup(text);
+}
+static void set_messages(JsonObject *result) {
+    JsonNode *node = result ? json_object_get_member(result, "messages") : NULL;
+    if (!node || !JSON_NODE_HOLDS_OBJECT(node)) return;
+    g_clear_pointer(&app.messages, json_object_unref);
+    app.messages = json_object_ref(json_node_get_object(node));
+}
+static void load_language(void) {
+    char *arguments[] = {app.backend, "interface-language", "--json", NULL};
+    char *output = NULL;
+    int status = 0;
+    if (g_spawn_sync(NULL, arguments, NULL, G_SPAWN_STDERR_TO_DEV_NULL, NULL, NULL, &output, NULL, &status, NULL)
+            && g_spawn_check_wait_status(status, NULL)) {
+        JsonParser *parser = json_parser_new();
+        if (json_parser_load_from_data(parser, output, -1, NULL) && JSON_NODE_HOLDS_OBJECT(json_parser_get_root(parser)))
+            set_messages(json_node_get_object(json_parser_get_root(parser)));
+        g_object_unref(parser);
+    }
+    g_free(output);
 }
 static char *json_text(JsonNode *node) {
     JsonGenerator *generator = json_generator_new();
@@ -90,9 +127,18 @@ static void diagnostic_sent(GObject *source, GAsyncResult *result, gpointer data
     (void)data;
     g_subprocess_communicate_utf8_finish(G_SUBPROCESS(source), result, NULL, NULL, NULL);
 }
+static void sanitize_child_media_env(GSubprocessLauncher *launcher) {
+    if (app.media_plugins_isolated) {
+        g_subprocess_launcher_unsetenv(launcher, "GST_PLUGIN_SYSTEM_PATH_1_0");
+        g_subprocess_launcher_unsetenv(launcher, "GST_REGISTRY_1_0");
+    }
+    if (app.dmabuf_default_set)
+        g_subprocess_launcher_unsetenv(launcher, "WEBKIT_DISABLE_DMABUF_RENDERER");
+}
 static void diagnostic_event(const char *message) {
     if (!app.backend || !app.profile) return;
     GSubprocessLauncher *launcher = g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_STDIN_PIPE | G_SUBPROCESS_FLAGS_STDOUT_SILENCE | G_SUBPROCESS_FLAGS_STDERR_SILENCE);
+    sanitize_child_media_env(launcher);
     g_subprocess_launcher_setenv(launcher, "CLAUDE_CAGE_CONFIG", app.profile, TRUE);
     GSubprocess *process = g_subprocess_launcher_spawn(launcher, NULL, app.backend, "diagnostic-event", NULL);
     g_object_unref(launcher);
@@ -156,6 +202,8 @@ static void command_finished(GObject *source, GAsyncResult *result, gpointer dat
     JsonParser *parser = json_parser_new();
     JsonObject *object = NULL;
     if (command->deadline) g_source_remove(command->deadline);
+    app.backend_commands--;
+    if (clipboard_sends) g_ptr_array_remove(clipboard_sends, command);
     if (g_subprocess_communicate_utf8_finish(G_SUBPROCESS(source), result, &output, NULL, &error)) {
         if (!output || strlen(output) > command->output_limit || !json_parser_load_from_data(parser, output, -1, NULL) ||
             !JSON_NODE_HOLDS_OBJECT(json_parser_get_root(parser))) {
@@ -177,9 +225,10 @@ static void command_finished(GObject *source, GAsyncResult *result, gpointer dat
     g_object_unref(command->cancel);
     g_free(command);
 }
-static void backend_arguments_limited(const char *const *args, guint seconds, gsize output_limit, BackendCallback callback, gpointer data) {
+static Command *backend_arguments_limited(const char *const *args, guint seconds, gsize output_limit, BackendCallback callback, gpointer data) {
     GError *error = NULL;
     GSubprocessLauncher *launcher = g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_SILENCE);
+    sanitize_child_media_env(launcher);
     g_subprocess_launcher_setenv(launcher, "CLAUDE_CAGE_CONFIG", app.profile, TRUE);
     if (g_strcmp0(args[1], "desktop") == 0) {
         char owner[32];
@@ -191,7 +240,7 @@ static void backend_arguments_limited(const char *const *args, guint seconds, gs
     if (!process) {
         callback(NULL, error, data);
         g_clear_error(&error);
-        return;
+        return NULL;
     }
     Command *command = g_new0(Command, 1);
     command->process = process;
@@ -200,10 +249,12 @@ static void backend_arguments_limited(const char *const *args, guint seconds, gs
     command->data = data;
     command->output_limit = output_limit;
     command->deadline = g_timeout_add_seconds(seconds, command_timeout, command);
+    app.backend_commands++;
     g_subprocess_communicate_utf8_async(process, NULL, command->cancel, command_finished, command);
+    return command;
 }
-static void backend_arguments(const char *const *args, guint seconds, BackendCallback callback, gpointer data) {
-    backend_arguments_limited(args, seconds, 65536, callback, data);
+static Command *backend_arguments(const char *const *args, guint seconds, BackendCallback callback, gpointer data) {
+    return backend_arguments_limited(args, seconds, 65536, callback, data);
 }
 static void backend(const char *action, const char *option, BackendCallback callback, gpointer data) {
     const char *args[] = {app.backend, action, "--json", option, NULL};
@@ -220,6 +271,17 @@ static void action(const char *name) {
     g_free(code);
     g_free(quoted);
 }
+static void publish_focus(void) {
+    if (!app.window) return;
+    gboolean focused = gtk_widget_get_visible(app.window) && gtk_window_is_active(GTK_WINDOW(app.window));
+    script(focused ?
+        "window.cageWindowFocused=true;window.dispatchEvent(new Event('cage-window-focus'));" :
+        "window.cageWindowFocused=false;window.dispatchEvent(new Event('cage-window-focus'));");
+}
+static void focus_changed(GObject *object, GParamSpec *spec, gpointer data) {
+    (void)object; (void)spec; (void)data;
+    publish_focus();
+}
 static void publish_visibility(void) {
     GdkWindow *window = gtk_widget_get_window(app.window);
     gboolean visible = gtk_widget_get_visible(app.window) && window &&
@@ -227,6 +289,7 @@ static void publish_visibility(void) {
     script(visible ?
         "window.cageWindowVisible=true;window.dispatchEvent(new Event('cage-window-visibility'));" :
         "window.cageWindowVisible=false;window.dispatchEvent(new Event('cage-window-visibility'));" );
+    publish_focus();
 }
 static gboolean visibility_changed(GtkWidget *widget, GdkEvent *event, gpointer data) {
     (void)widget; (void)event; (void)data;
@@ -246,7 +309,7 @@ static gboolean quit_idle(gpointer data) {
 }
 static void show_error(const char *message) {
     diagnostic_event(message);
-    gtk_label_set_text(GTK_LABEL(app.status), message);
+    gtk_label_set_text(GTK_LABEL(app.status), ui_text(message));
     gtk_stack_set_visible_child_name(GTK_STACK(app.stack), "status");
     gtk_widget_show(app.retry);
 }
@@ -266,8 +329,8 @@ static void reply_error(WebKitScriptMessageReply *reply, const char *message) {
 static char *choose_file(GtkFileChooserAction kind, const char *title, const char *filename) {
     if (app.picker_open) return NULL;
     app.picker_open = TRUE;
-    GtkWidget *dialog = gtk_file_chooser_dialog_new(title, GTK_WINDOW(app.window), kind,
-        "取消", GTK_RESPONSE_CANCEL, kind == GTK_FILE_CHOOSER_ACTION_SAVE ? "保存" : "选择", GTK_RESPONSE_ACCEPT, NULL);
+    GtkWidget *dialog = gtk_file_chooser_dialog_new(ui_text(title), GTK_WINDOW(app.window), kind,
+        ui_text("取消"), GTK_RESPONSE_CANCEL, ui_text(kind == GTK_FILE_CHOOSER_ACTION_SAVE ? "保存" : "选择"), GTK_RESPONSE_ACCEPT, NULL);
     gtk_file_chooser_set_local_only(GTK_FILE_CHOOSER(dialog), TRUE);
     if (kind == GTK_FILE_CHOOSER_ACTION_SAVE) {
         char *base = g_path_get_basename(filename && *filename ? filename : "Cage.cage-theme.json");
@@ -278,7 +341,7 @@ static char *choose_file(GtkFileChooserAction kind, const char *title, const cha
     if (kind != GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER) {
         GtkFileFilter *filter = gtk_file_filter_new();
         gboolean diagnostic = filename && g_str_has_suffix(filename, ".zip");
-        gtk_file_filter_set_name(filter, diagnostic ? "诊断包 (*.zip)" : "Cage 主题 (*.json)");
+        gtk_file_filter_set_name(filter, ui_text(diagnostic ? "诊断包 (*.zip)" : "Cage 主题 (*.json)"));
         gtk_file_filter_add_pattern(filter, diagnostic ? "*.zip" : "*.json");
         gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
     }
@@ -288,7 +351,7 @@ static char *choose_file(GtkFileChooserAction kind, const char *title, const cha
     app.picker_open = FALSE;
     return path;
 }
-typedef struct { WebKitScriptMessageReply *reply; JSCContext *context; gboolean sync; guint64 revision, generation; char *connection; GPtrArray *clipboard_paths; } PendingReply;
+typedef struct { WebKitScriptMessageReply *reply; JSCContext *context; gboolean sync, defer_files; guint64 revision, generation; char *connection; GPtrArray *clipboard_paths; } PendingReply;
 static PendingReply *pending_reply(WebKitScriptMessageReply *reply, JSCContext *context) {
     PendingReply *pending = g_new0(PendingReply, 1);
     pending->reply = webkit_script_message_reply_ref(reply);
@@ -304,6 +367,170 @@ static void pending_free(PendingReply *pending) {
     g_object_unref(pending->context);
     g_free(pending->connection);
     g_free(pending);
+}
+/* Notifications go straight to the freedesktop notification service. GNotification
+   would route through org.gtk.Notifications on GNOME, which drops notifications
+   whose application ID has no matching .desktop file, and it cannot report that.
+   Each notification keeps its own click target, keyed by the server's ID. */
+#define NOTIFY_NAME "org.freedesktop.Notifications"
+#define NOTIFY_PATH "/org/freedesktop/Notifications"
+#define NOTIFY_TARGETS 128
+static GDBusConnection *notify_bus;
+static GHashTable *notify_targets, *notify_tokens;
+static void open_notification_target(const char *raw, const char *token) {
+    if (app.window) {
+        if (token && *token) gtk_window_set_startup_id(GTK_WINDOW(app.window), token);
+        gtk_widget_show(app.window);
+        gtk_window_deiconify(GTK_WINDOW(app.window));
+        gtk_window_present(GTK_WINDOW(app.window));
+        publish_visibility();
+    }
+    if (!raw || !*raw) return;
+    const char *sep = strchr(raw, '\n');
+    char *terminal_id = sep ? g_strndup(raw, (gsize)(sep - raw)) : g_strdup(raw);
+    const char *connection_id = sep ? sep + 1 : "";
+    if (*terminal_id) {
+        char *q_term = quote(terminal_id);
+        char *q_conn = quote(connection_id);
+        char *code = g_strdup_printf("window.dispatchEvent(new CustomEvent('cage-notification-click',{detail:{terminal_id:%s,connection_id:%s}}));", q_term, q_conn);
+        script(code);
+        g_free(code); g_free(q_conn); g_free(q_term);
+    }
+    g_free(terminal_id);
+}
+static void notification_signal(GDBusConnection *connection, const char *sender, const char *path, const char *interface, const char *signal, GVariant *parameters, gpointer data) {
+    (void)connection; (void)sender; (void)path; (void)interface; (void)data;
+    guint32 id = 0;
+    if (!strcmp(signal, "ActivationToken") && g_variant_is_of_type(parameters, G_VARIANT_TYPE("(us)"))) {
+        const char *token = NULL;
+        g_variant_get(parameters, "(u&s)", &id, &token);
+        if (g_hash_table_contains(notify_targets, GUINT_TO_POINTER(id)))
+            g_hash_table_replace(notify_tokens, GUINT_TO_POINTER(id), g_strdup(token));
+    } else if (!strcmp(signal, "ActionInvoked") && g_variant_is_of_type(parameters, G_VARIANT_TYPE("(us)"))) {
+        const char *action_key = NULL;
+        g_variant_get(parameters, "(u&s)", &id, &action_key);
+        char *target = g_hash_table_lookup(notify_targets, GUINT_TO_POINTER(id));
+        if (target && !strcmp(action_key, "default"))
+            open_notification_target(target, g_hash_table_lookup(notify_tokens, GUINT_TO_POINTER(id)));
+        if (target) {
+            g_hash_table_remove(notify_tokens, GUINT_TO_POINTER(id));
+            g_hash_table_remove(notify_targets, GUINT_TO_POINTER(id));
+        }
+    } else if (!strcmp(signal, "NotificationClosed") && g_variant_is_of_type(parameters, G_VARIANT_TYPE("(uu)"))) {
+        guint32 reason = 0;
+        g_variant_get(parameters, "(uu)", &id, &reason);
+        g_hash_table_remove(notify_tokens, GUINT_TO_POINTER(id));
+        g_hash_table_remove(notify_targets, GUINT_TO_POINTER(id));
+    }
+}
+static GDBusConnection *notification_bus(void) {
+    if (notify_bus) return notify_bus;
+    GError *error = NULL;
+    notify_bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &error);
+    if (!notify_bus) {
+        diagnostic_event(error ? error->message : "session bus unavailable");
+        g_clear_error(&error);
+        return NULL;
+    }
+    notify_targets = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
+    notify_tokens = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
+    g_dbus_connection_signal_subscribe(notify_bus, NOTIFY_NAME, NOTIFY_NAME, NULL, NOTIFY_PATH, NULL,
+        G_DBUS_SIGNAL_FLAGS_NONE, notification_signal, NULL, NULL);
+    return notify_bus;
+}
+/* The service reports whether it can play sounds; Cage offers the sound
+   switch only when it can. An unreachable service is reported, not hidden. */
+static void notification_status_finished(GObject *source, GAsyncResult *result, gpointer data) {
+    PendingReply *pending = data;
+    GError *error = NULL;
+    GVariant *value = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), result, &error);
+    gboolean sound = FALSE;
+    if (value) {
+        GVariantIter *caps = NULL;
+        const char *cap = NULL;
+        g_variant_get(value, "(as)", &caps);
+        while (g_variant_iter_next(caps, "&s", &cap)) if (!strcmp(cap, "sound")) sound = TRUE;
+        g_variant_iter_free(caps);
+        g_variant_unref(value);
+        reply_json(pending->reply, pending->context, sound
+            ? "{\"supported\":true,\"permission\":\"authorized\",\"canOpenSettings\":false,\"sound\":true}"
+            : "{\"supported\":true,\"permission\":\"authorized\",\"canOpenSettings\":false,\"sound\":false}");
+    } else {
+        diagnostic_event(error->message);
+        g_clear_error(&error);
+        reply_json(pending->reply, pending->context, "{\"supported\":false,\"permission\":\"unavailable\",\"canOpenSettings\":false,\"sound\":false}");
+    }
+    pending_free(pending);
+}
+static void notification_status(WebKitScriptMessageReply *reply, JSCContext *context) {
+    GDBusConnection *bus = notification_bus();
+    if (!bus) {
+        reply_json(reply, context, "{\"supported\":false,\"permission\":\"unavailable\",\"canOpenSettings\":false,\"sound\":false}");
+        return;
+    }
+    g_dbus_connection_call(bus, NOTIFY_NAME, NOTIFY_PATH, NOTIFY_NAME, "GetCapabilities", NULL, G_VARIANT_TYPE("(as)"),
+        G_DBUS_CALL_FLAGS_NONE, 3000, NULL, notification_status_finished, pending_reply(reply, context));
+}
+typedef struct { PendingReply *pending; char *target; } NotificationSend;
+static void notification_sent(GObject *source, GAsyncResult *result, gpointer data) {
+    NotificationSend *send = data;
+    GError *error = NULL;
+    GVariant *value = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), result, &error);
+    if (value) {
+        guint32 id = 0;
+        g_variant_get(value, "(u)", &id);
+        g_variant_unref(value);
+        if (g_hash_table_size(notify_targets) >= NOTIFY_TARGETS) {
+            g_hash_table_remove_all(notify_targets);
+            g_hash_table_remove_all(notify_tokens);
+        }
+        g_hash_table_replace(notify_targets, GUINT_TO_POINTER(id), send->target);
+        send->target = NULL;
+        reply_json(send->pending->reply, send->pending->context, "{\"delivered\":true,\"permission\":\"authorized\"}");
+    } else {
+        diagnostic_event(error->message);
+        g_clear_error(&error);
+        reply_json(send->pending->reply, send->pending->context, "{\"delivered\":false,\"permission\":\"unavailable\"}");
+    }
+    pending_free(send->pending);
+    g_free(send->target);
+    g_free(send);
+}
+static void notification_send(WebKitScriptMessageReply *reply, JSCContext *context, const char *title, const char *body,
+                              const char *terminal_id, const char *connection_id, gboolean sound) {
+    GDBusConnection *bus = notification_bus();
+    if (!bus) {
+        reply_json(reply, context, "{\"delivered\":false,\"permission\":\"unavailable\"}");
+        return;
+    }
+    GVariantBuilder actions, hints;
+    g_variant_builder_init(&actions, G_VARIANT_TYPE("as"));
+    g_variant_builder_add(&actions, "s", "default");
+    g_variant_builder_add(&actions, "s", "Cage");
+    g_variant_builder_init(&hints, G_VARIANT_TYPE("a{sv}"));
+    g_variant_builder_add(&hints, "{sv}", "desktop-entry", g_variant_new_string("io.github.lee_xeo.Cage"));
+    if (sound) g_variant_builder_add(&hints, "{sv}", "sound-name", g_variant_new_string("message-new-instant"));
+    else g_variant_builder_add(&hints, "{sv}", "suppress-sound", g_variant_new_boolean(TRUE));
+    NotificationSend *send = g_new0(NotificationSend, 1);
+    send->pending = pending_reply(reply, context);
+    send->target = g_strdup_printf("%s\n%s", terminal_id, connection_id);
+    g_dbus_connection_call(bus, NOTIFY_NAME, NOTIFY_PATH, NOTIFY_NAME, "Notify",
+        g_variant_new("(susssasa{sv}i)", "Cage", 0, "io.github.lee_xeo.Cage", title, body, &actions, &hints, -1),
+        G_VARIANT_TYPE("(u)"), G_DBUS_CALL_FLAGS_NONE, 5000, NULL, notification_sent, send);
+}
+static void language_refreshed(JsonObject *object, const GError *error, gpointer data) {
+    PendingReply *pending = data;
+    if (error) reply_error(pending->reply, error->message);
+    else {
+        set_messages(object);
+        update_menu();
+        gtk_button_set_label(GTK_BUTTON(app.retry), ui_text("重试连接"));
+        gtk_button_set_label(GTK_BUTTON(app.existing), ui_text("打开现有环境保存文件"));
+        gtk_button_set_label(GTK_BUTTON(app.complete), ui_text("保存后停止环境并完成更新"));
+        gtk_window_set_title(GTK_WINDOW(app.window), app.needs_update ? ui_text("Cage（更新待完成）") : "Cage");
+        reply_json(pending->reply, pending->context, "true");
+    }
+    pending_free(pending);
 }
 // Linux packages are installed by the system. The App only learns whether a
 // newer package was published, so the workbench can point to it.
@@ -362,6 +589,7 @@ static void update_check_finished(GObject *source, GAsyncResult *result, gpointe
 static void update_check(WebKitScriptMessageReply *reply, JSCContext *context) {
     const char *args[] = {app.backend, "app-update", "check", NULL};
     GSubprocessLauncher *launcher = g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_SILENCE);
+    sanitize_child_media_env(launcher);
     g_subprocess_launcher_setenv(launcher, "CLAUDE_CAGE_CONFIG", app.profile, TRUE);
     GSubprocess *process = update_checking ? NULL : g_subprocess_launcher_spawnv(launcher, args, NULL);
     g_object_unref(launcher);
@@ -505,14 +733,25 @@ static void reply_selected_uris(char **uris, PendingReply *pending) {
         }
         g_free(hostname); g_ptr_array_add(paths, path);
     }
+    if (!error && pending->sync && !pending->defer_files && pending->generation != clipboard_generation)
+        g_set_error_literal(&error, G_IO_ERROR, G_IO_ERROR_CANCELLED, "剪贴板文件传递已取消。");
     if (!error && pending->sync) {
+        if (pending->defer_files) {
+            char *json = g_strdup_printf("{\"revision\":%lu,\"files_pending\":true,\"count\":%u}", (unsigned long)pending->revision, paths->len);
+            reply_json(pending->reply, pending->context, json);
+            g_free(json); g_ptr_array_unref(paths); pending_free(pending); return;
+        }
         if (!clipboard_readers) clipboard_readers = g_ptr_array_new();
         pending->clipboard_paths = g_ptr_array_ref(paths);
         g_ptr_array_add(clipboard_readers, pending->clipboard_paths);
         const char **args = g_new0(const char *, paths->len + 7);
         args[0] = app.backend; args[1] = "clipboard-files"; args[2] = "--json"; args[3] = "--connection"; args[4] = pending->connection; args[5] = "send";
         for (guint i = 0; i < paths->len; i++) args[i + 6] = g_ptr_array_index(paths, i);
-        backend_arguments(args, 1800, browser_file_finished, pending);
+        Command *command = backend_arguments(args, 1800, browser_file_finished, pending);
+        if (command) {
+            if (!clipboard_sends) clipboard_sends = g_ptr_array_new();
+            g_ptr_array_add(clipboard_sends, command);
+        }
         g_free(args); g_ptr_array_unref(paths); return;
     }
     char *json = error ? NULL : remember_files(paths, &error);
@@ -705,11 +944,25 @@ static void smoke_report(char *evidence) {
     g_application_quit(G_APPLICATION(app.application));
 }
 static void smoke_stopped(JsonObject *object, const GError *error, gpointer data) {
-    if (error || g_strcmp0(text_member(object, "status"), "prepared") != 0) {
-        g_printerr("Linux smoke: controller cleanup failed.\n");
+    const char *status = text_member(object, "status");
+    if (error || g_strcmp0(status, "prepared") != 0) {
+        /* prepare-update returns only status and message, never a session URL. */
+        const char *message = text_member(object, "message");
+        g_printerr("Linux smoke: controller cleanup failed (error: %.500s; status: %s; message: %.500s).\n",
+            error ? error->message : "none", *status ? status : "none", *message ? message : "none");
         g_free(data);
         g_application_quit(G_APPLICATION(app.application));
     } else smoke_report(data);
+}
+/* The page can still ask the bridge to refresh its session, which runs
+ * "desktop" and may start a new connection service while prepare-update is
+ * retiring the old one. Refuse new bridge requests, then let commands already
+ * running finish before the smoke reports or stops the services. */
+static gboolean smoke_finish_when_idle(gpointer data) {
+    if (app.backend_commands) return G_SOURCE_CONTINUE;
+    if (g_strcmp0(app.storage_phase, "seed") == 0) smoke_report(data);
+    else backend("prepare-update", NULL, smoke_stopped, data);
+    return G_SOURCE_REMOVE;
 }
 static void smoke_snapshot(GObject *source, GAsyncResult *result, gpointer data) {
     char *report = data;
@@ -719,9 +972,10 @@ static void smoke_snapshot(GObject *source, GAsyncResult *result, gpointer data)
     gboolean saved = surface && cairo_surface_write_to_png(surface, path) == CAIRO_STATUS_SUCCESS;
     if (surface) cairo_surface_destroy(surface);
     g_free(path); g_clear_error(&error);
-    if (saved && g_strcmp0(app.storage_phase, "seed") == 0) smoke_report(report);
-    else if (saved) backend("prepare-update", NULL, smoke_stopped, report);
-    else {
+    if (saved) {
+        app.smoke_finishing = TRUE;
+        if (smoke_finish_when_idle(report) == G_SOURCE_CONTINUE) g_timeout_add(50, smoke_finish_when_idle, report);
+    } else {
         g_printerr("Linux smoke: could not capture rendered workbench.\n");
         g_free(report);
         g_application_quit(G_APPLICATION(app.application));
@@ -810,6 +1064,10 @@ static gboolean bridge_received(WebKitUserContentManager *manager, JSCValue *val
         reply_error(reply, "原生请求格式无效。");
         goto done;
     }
+    if (app.smoke_finishing) {
+        reply_error(reply, "自检正在结束，未执行新的原生操作。");
+        goto done;
+    }
     JsonObject *request = json_node_get_object(request_node);
     const char *name = text_member(request, "action");
     JSCContext *context = jsc_value_get_context(value);
@@ -847,8 +1105,16 @@ static gboolean bridge_received(WebKitUserContentManager *manager, JSCValue *val
         if (!uri) reply_error(reply, "未知的项目页面");
         else {
             GError *error = NULL;
-            if (g_app_info_launch_default_for_uri(uri, NULL, &error)) reply_json(reply, context, "true");
+            GAppLaunchContext *launch_context = g_app_launch_context_new();
+            if (app.media_plugins_isolated) {
+                g_app_launch_context_unsetenv(launch_context, "GST_PLUGIN_SYSTEM_PATH_1_0");
+                g_app_launch_context_unsetenv(launch_context, "GST_REGISTRY_1_0");
+            }
+            if (app.dmabuf_default_set)
+                g_app_launch_context_unsetenv(launch_context, "WEBKIT_DISABLE_DMABUF_RENDERER");
+            if (g_app_info_launch_default_for_uri(uri, launch_context, &error)) reply_json(reply, context, "true");
             else { reply_error(reply, "无法打开项目页面，请检查默认浏览器"); g_clear_error(&error); }
+            g_object_unref(launch_context);
         }
     } else if (!strcmp(name, "appUpdate")) {
         const char *operation = text_member(request, "operation");
@@ -874,8 +1140,8 @@ static gboolean bridge_received(WebKitUserContentManager *manager, JSCValue *val
             char *path = NULL;
             if (!strcmp(operation,"save")) {
                 app.picker_open = TRUE;
-                GtkWidget *dialog = gtk_file_chooser_dialog_new("将下载另存为到本机", GTK_WINDOW(app.window), GTK_FILE_CHOOSER_ACTION_SAVE,
-                    "取消", GTK_RESPONSE_CANCEL, "保存", GTK_RESPONSE_ACCEPT, NULL);
+                GtkWidget *dialog = gtk_file_chooser_dialog_new(ui_text("将下载另存为到本机"), GTK_WINDOW(app.window), GTK_FILE_CHOOSER_ACTION_SAVE,
+                    ui_text("取消"), GTK_RESPONSE_CANCEL, ui_text("保存"), GTK_RESPONSE_ACCEPT, NULL);
                 char *base = g_path_get_basename(text_member(request,"name"));
                 gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dialog), *base ? base : "download");
                 gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dialog), TRUE);
@@ -917,24 +1183,37 @@ static gboolean bridge_received(WebKitUserContentManager *manager, JSCValue *val
     } else if (!strcmp(name, "clipboardRevision")) {
         char revision[32]; g_snprintf(revision,sizeof(revision),"%lu",(unsigned long)clipboard_current_revision()); reply_json(reply,context,revision);
     } else if (!strcmp(name, "clipboardSyncCancel")) {
-        clipboard_generation++; reply_json(reply,context,"true");
+        clipboard_generation++;
+        for (guint i = 0; clipboard_sends && i < clipboard_sends->len; i++) {
+            Command *command = g_ptr_array_index(clipboard_sends, i);
+            g_subprocess_force_exit(command->process);
+        }
+        reply_json(reply,context,"true");
     } else if (!strcmp(name, "clipboardSyncRelease")) {
         const char *id = text_member(request, "files");
+        const char *connection = text_member(request, "connection_id");
+        if (!*connection) connection = "local";
         if (!g_uuid_string_is_valid(id)) reply_error(reply, "剪贴板文件标识无效。");
         else {
-            const char *args[] = {app.backend, "clipboard-files", "--json", "--connection", text_member(request, "connection_id"), "release", id, NULL};
+            const char *args[] = {app.backend, "clipboard-files", "--json", "--connection", connection, "release", id, NULL};
             backend_arguments(args, 10, browser_file_finished, pending_reply(reply, context));
         }
     } else if (!strcmp(name, "clipboardSyncRead")) {
-        PendingReply *pending = pending_reply(reply,context); pending->sync = TRUE; pending->generation = clipboard_generation; pending->revision = clipboard_current_revision(); pending->connection = g_strdup(text_member(request,"connection_id"));
+        const char *connection = text_member(request, "connection_id");
+        if (!*connection) connection = "local";
+        PendingReply *pending = pending_reply(reply,context); pending->sync = TRUE; pending->generation = clipboard_generation; pending->revision = clipboard_current_revision(); pending->connection = g_strdup(connection);
+        JsonNode *defer = json_object_get_member(request,"defer_files");
+        pending->defer_files = defer && JSON_NODE_HOLDS_VALUE(defer) && json_node_get_value_type(defer) == G_TYPE_BOOLEAN && json_node_get_boolean(defer);
         gtk_clipboard_request_uris(gtk_clipboard_get(GDK_SELECTION_CLIPBOARD),clipboard_file_uris,pending);
     } else if (!strcmp(name, "clipboardSyncWrite")) {
+        const char *connection = text_member(request, "connection_id");
+        if (!*connection) connection = "local";
         PendingReply *pending = pending_reply(reply,context); pending->generation = clipboard_generation; pending->revision = json_object_has_member(request,"revision") ? (guint64)json_object_get_int_member(request,"revision") : clipboard_current_revision();
         if (pending->revision != clipboard_current_revision()) clipboard_sync_reply(pending,TRUE);
         else if (*text_member(request,"files")) {
             const char *id = text_member(request,"files");
             if (!g_uuid_string_is_valid(id)) { reply_error(reply,"剪贴板文件标识无效。"); pending_free(pending); }
-            else { const char *args[] = {app.backend,"clipboard-files","--json","--connection",text_member(request,"connection_id"),"receive",id,NULL}; backend_arguments(args,1800,clipboard_files_received,pending); }
+            else { const char *args[] = {app.backend,"clipboard-files","--json","--connection",connection,"receive",id,NULL}; backend_arguments(args,1800,clipboard_files_received,pending); }
         } else if (*text_member(request,"png")) {
             gsize length = 0; guchar *bytes = g_base64_decode(text_member(request,"png"),&length);
             GdkPixbufLoader *loader = gdk_pixbuf_loader_new_with_type("png",NULL);
@@ -953,8 +1232,8 @@ static gboolean bridge_received(WebKitUserContentManager *manager, JSCValue *val
         if (app.picker_open) reply_error(reply, "请先完成当前文件窗口。");
         else {
             app.picker_open = TRUE;
-            GtkWidget *dialog = gtk_file_chooser_dialog_new("选择本机文件", GTK_WINDOW(app.window), GTK_FILE_CHOOSER_ACTION_OPEN,
-                "取消", GTK_RESPONSE_CANCEL, "选择", GTK_RESPONSE_ACCEPT, NULL);
+            GtkWidget *dialog = gtk_file_chooser_dialog_new(ui_text("选择本机文件"), GTK_WINDOW(app.window), GTK_FILE_CHOOSER_ACTION_OPEN,
+                ui_text("取消"), GTK_RESPONSE_CANCEL, ui_text("选择"), GTK_RESPONSE_ACCEPT, NULL);
             JsonNode *multiple = json_object_get_member(request, "multiple");
             gtk_file_chooser_set_select_multiple(GTK_FILE_CHOOSER(dialog), multiple && JSON_NODE_HOLDS_VALUE(multiple) && json_node_get_value_type(multiple) == G_TYPE_BOOLEAN && json_node_get_boolean(multiple));
             gtk_file_chooser_set_local_only(GTK_FILE_CHOOSER(dialog), TRUE);
@@ -1003,7 +1282,9 @@ static gboolean bridge_received(WebKitUserContentManager *manager, JSCValue *val
         else {
             g_object_set(gtk_settings_get_default(), "gtk-application-prefer-dark-theme",
                 !strcmp(mode, "system") ? app.initial_dark : !strcmp(mode, "dark"), NULL);
-            webkit_web_view_set_background_color(app.web, &color);
+            app.background_color = color;
+            app.has_background_color = TRUE;
+            if (app.web) webkit_web_view_set_background_color(app.web, &color);
             reply_json(reply, context, "true");
         }
     } else if (!strcmp(name, "importTheme")) {
@@ -1060,6 +1341,26 @@ static gboolean bridge_received(WebKitUserContentManager *manager, JSCValue *val
             g_free(path);
         }
         g_object_unref(theme_parser);
+    } else if (!strcmp(name, "notificationStatus") || !strcmp(name, "requestNotificationPermission")) {
+        notification_status(reply, context);
+    } else if (!strcmp(name, "openNotificationSettings")) {
+        reply_json(reply, context, "false");
+    } else if (!strcmp(name, "showNotification")) {
+        const char *title = text_member(request, "title");
+        const char *body = text_member(request, "body");
+        const char *terminal_id = text_member(request, "terminal_id");
+        const char *connection_id = text_member(request, "connection_id");
+        JsonNode *sound = request ? json_object_get_member(request, "sound") : NULL;
+        gboolean valid_terminal = !*terminal_id || (strlen(terminal_id) == 16 && strspn(terminal_id, "0123456789abcdef") == 16);
+        if (!*title || strlen(title) > 600 || !g_utf8_validate(title, -1, NULL)) reply_error(reply, "通知标题无效。");
+        else if (strlen(body) > 1500 || !g_utf8_validate(body, -1, NULL)) reply_error(reply, "通知内容过长。");
+        else if (!valid_terminal) reply_error(reply, "通知目标终端无效。");
+        else if (strlen(connection_id) > 128) reply_error(reply, "通知连接标识无效。");
+        else notification_send(reply, context, title, body, terminal_id, connection_id,
+            !sound || !JSON_NODE_HOLDS_VALUE(sound) || json_node_get_value_type(sound) != G_TYPE_BOOLEAN || json_node_get_boolean(sound));
+    } else if (!strcmp(name, "refreshLanguage")) {
+        const char *args[] = {"interface-language", "--json", NULL};
+        backend_arguments_limited(args, 4, 64 * 1024, language_refreshed, pending_reply(reply, context));
     } else if (!strcmp(name, "refreshSession")) {
         backend("desktop", app.needs_update ? "--existing" : NULL, session_refreshed, pending_reply(reply, context));
     } else if (!strcmp(name, "reconnect")) {
@@ -1111,8 +1412,9 @@ static void bootstrapped(JsonObject *object, const GError *error, gpointer data)
         }
         if (chinese) show_error(error->message);
         else {
-            char *message = g_strdup_printf("启动工作台失败：本机后台未返回可识别的原因（错误码 %d）。请点击“重试连接”；仍失败时请保留此提示并反馈给维护者。", error->code);
-            show_error(message); g_free(message);
+            char *code = g_strdup_printf("%d", error->code);
+            char *message = ui_format("启动工作台失败：本机后台未返回可识别的原因（错误代码 {0}）。请点击“重试连接”；仍失败时请保留此提示并反馈给维护者。", code);
+            show_error(message); g_free(message); g_free(code);
         }
         return;
     }
@@ -1132,13 +1434,13 @@ static void bootstrapped(JsonObject *object, const GError *error, gpointer data)
     g_uri_unref(uri);
     app.ready = FALSE;
     install_bridge();
-    gtk_window_set_title(GTK_WINDOW(app.window), app.needs_update ? "Cage（更新待完成）" : "Cage");
+    gtk_window_set_title(GTK_WINDOW(app.window), app.needs_update ? ui_text("Cage（更新待完成）") : "Cage");
     webkit_web_view_load_uri(app.web, url);
 }
 static void bootstrap(const char *option) {
     if (app.bootstrapping) return;
     app.bootstrapping = TRUE;
-    gtk_label_set_text(GTK_LABEL(app.status), "正在连接 Cage 工作台…");
+    gtk_label_set_text(GTK_LABEL(app.status), ui_text("正在连接 Cage 工作台…"));
     gtk_stack_set_visible_child_name(GTK_STACK(app.stack), "status");
     gtk_widget_hide(app.retry); gtk_widget_hide(app.existing); gtk_widget_hide(app.complete);
     backend("desktop", option, bootstrapped, NULL);
@@ -1148,7 +1450,7 @@ static void existing_clicked(GtkButton *button, gpointer data) { (void)button; (
 static void complete_clicked(GtkButton *button, gpointer data) {
     (void)button; (void)data;
     GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(app.window), GTK_DIALOG_MODAL, GTK_MESSAGE_QUESTION, GTK_BUTTONS_OK_CANCEL,
-        "请先保存文件。继续后将停止 Cage 环境并完成后台更新，终端任务会结束，项目和登录状态会保留。");
+        "%s", ui_text("请先保存文件。继续后将停止 Cage 环境并完成后台更新，终端任务会结束，项目和登录状态会保留。"));
     gboolean accepted = gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK;
     gtk_widget_destroy(dialog);
     if (accepted) bootstrap("--complete-update");
@@ -1163,8 +1465,20 @@ static gboolean decide_policy(WebKitWebView *web, WebKitPolicyDecision *decision
     }
     return FALSE;
 }
-static gboolean deny_permission(WebKitWebView *web, WebKitPermissionRequest *request, gpointer data) {
-    (void)web; (void)data; webkit_permission_request_deny(request); return TRUE;
+static gboolean handle_permission(WebKitWebView *web, WebKitPermissionRequest *request, gpointer data) {
+    (void)data;
+    if (WEBKIT_IS_USER_MEDIA_PERMISSION_REQUEST(request)) {
+        WebKitUserMediaPermissionRequest *media = WEBKIT_USER_MEDIA_PERMISSION_REQUEST(request);
+        const char *uri = webkit_web_view_get_uri(web);
+        if (webkit_user_media_permission_is_for_audio_device(media) &&
+            !webkit_user_media_permission_is_for_video_device(media) &&
+            valid_workbench(uri, app.port, FALSE)) {
+            webkit_permission_request_allow(request);
+            return TRUE;
+        }
+    }
+    webkit_permission_request_deny(request);
+    return TRUE;
 }
 static gboolean workbench_file_chooser(WebKitWebView *web, WebKitFileChooserRequest *request, gpointer data) {
     (void)data;
@@ -1181,6 +1495,7 @@ static gboolean deny_context_menu(WebKitWebView *web, WebKitContextMenu *menu, G
 }
 static void load_changed(WebKitWebView *web, WebKitLoadEvent event, gpointer data) {
     (void)data;
+    if (web != app.web) return;
     if (event == WEBKIT_LOAD_STARTED) app.navigation_failed = FALSE;
     if (event == WEBKIT_LOAD_FINISHED && !app.navigation_failed && valid_workbench(webkit_web_view_get_uri(web), app.port, FALSE)) {
         gtk_stack_set_visible_child_name(GTK_STACK(app.stack), "web");
@@ -1189,46 +1504,170 @@ static void load_changed(WebKitWebView *web, WebKitLoadEvent event, gpointer dat
     }
 }
 static gboolean load_failed(WebKitWebView *web, WebKitLoadEvent event, const char *uri, GError *error, gpointer data) {
-    (void)web; (void)event; (void)uri; (void)data;
+    (void)event; (void)uri; (void)data;
+    if (web != app.web) return TRUE;
     app.navigation_failed = TRUE;
     if (error) diagnostic_event(error->message);
-    char *message = g_strdup_printf("打开工作台失败：内置网页组件未能加载本机后台（错误码 %d）。请点击“重试连接”；仍失败时请保留此错误提示并反馈给维护者。后台任务不会因此自动结束。", error ? error->code : 0);
+    char *code = g_strdup_printf("%d", error ? error->code : 0);
+    char *message = ui_format("打开工作台失败：内置网页组件未能加载本机工作台（错误代码 {0}）。请点击“重试连接”；仍失败时请保留此错误提示并反馈给维护者。后台任务不会因此自动结束。", code);
     show_error(message);
-    g_free(message);
+    g_free(message); g_free(code);
     return TRUE;
 }
+static gboolean retry_software_fallback(gpointer data) {
+    (void)data;
+    bootstrap(NULL);
+    return G_SOURCE_REMOVE;
+}
 static void process_terminated(WebKitWebView *web, WebKitWebProcessTerminationReason reason, gpointer data) {
-    (void)web; (void)reason; (void)data;
+    (void)data;
+    if (web != app.web) return;
+    const char *kind = reason == WEBKIT_WEB_PROCESS_CRASHED ? "crashed"
+        : reason == WEBKIT_WEB_PROCESS_EXCEEDED_MEMORY_LIMIT ? "exceeded-memory"
+        : "terminated-by-api";
+    char *detail = g_strdup_printf(
+        "WebKitWebProcess terminated (reason=%s, webkit=%u.%u.%u, media_isolated=%d, software_fallback=%d)",
+        kind, webkit_get_major_version(), webkit_get_minor_version(), webkit_get_micro_version(),
+        app.media_plugins_isolated ? 1 : 0, app.software_fallback ? 1 : 0);
+    diagnostic_event(detail);
+    g_free(detail);
+    if (reason == WEBKIT_WEB_PROCESS_CRASHED && !app.software_fallback) {
+        app.software_fallback = TRUE;
+        WebKitSettings *web_settings = webkit_web_view_get_settings(web);
+        webkit_settings_set_hardware_acceleration_policy(web_settings, WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER);
+        webkit_settings_set_enable_media(web_settings, FALSE);
+        if (!app.ready) {
+            g_idle_add(retry_software_fallback, NULL);
+            return;
+        }
+    }
     show_error("工作台显示进程已退出。后台任务保留，可重试连接。");
+}
+static void install_web_view(void) {
+    if (app.web) {
+        WebKitWebView *previous = app.web;
+        app.web = NULL;
+        webkit_web_view_stop_loading(previous);
+        gtk_container_remove(GTK_CONTAINER(app.stack), GTK_WIDGET(previous));
+    }
+    app.web = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW, "web-context", app.web_context, "user-content-manager", app.content, NULL));
+    input_initialize(app.web);
+    WebKitSettings *web_settings = webkit_web_view_get_settings(app.web);
+    webkit_settings_set_enable_developer_extras(web_settings, FALSE);
+    webkit_settings_set_javascript_can_open_windows_automatically(web_settings, FALSE);
+    webkit_settings_set_enable_write_console_messages_to_stdout(web_settings, FALSE);
+    webkit_settings_set_enable_webgl(web_settings, FALSE);
+    webkit_settings_set_enable_media_stream(web_settings, !app.software_fallback);
+    if (app.software_fallback) {
+        webkit_settings_set_hardware_acceleration_policy(web_settings, WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER);
+        webkit_settings_set_enable_media(web_settings, FALSE);
+    }
+#if WEBKIT_CHECK_VERSION(2, 38, 0)
+    webkit_settings_set_enable_webrtc(web_settings, FALSE);
+#endif
+    if (app.has_background_color)
+        webkit_web_view_set_background_color(app.web, &app.background_color);
+    g_signal_connect(app.web, "decide-policy", G_CALLBACK(decide_policy), NULL);
+    g_signal_connect(app.web, "permission-request", G_CALLBACK(handle_permission), NULL);
+    g_signal_connect(app.web, "run-file-chooser", G_CALLBACK(workbench_file_chooser), NULL);
+    g_signal_connect(app.web, "context-menu", G_CALLBACK(deny_context_menu), NULL);
+    g_signal_connect(app.web, "load-changed", G_CALLBACK(load_changed), NULL);
+    g_signal_connect(app.web, "load-failed", G_CALLBACK(load_failed), NULL);
+    g_signal_connect(app.web, "web-process-terminated", G_CALLBACK(process_terminated), NULL);
+    gtk_stack_add_named(GTK_STACK(app.stack), GTK_WIDGET(app.web), "web");
+    gtk_widget_show(GTK_WIDGET(app.web));
+}
+typedef struct { WebKitWebView *web; GCancellable *cancel; guint deadline; gboolean timed_out; } QuitProbe;
+static gboolean quit_probe_timeout(gpointer data) {
+    QuitProbe *probe = data;
+    gboolean current = (probe->web == app.web);
+    probe->deadline = 0;
+    probe->timed_out = TRUE;
+    app.quit_pending = FALSE;
+    g_cancellable_cancel(probe->cancel);
+    if (current) {
+        diagnostic_event("Workbench did not respond to quit request within 1.5s; exiting desktop window");
+        g_application_quit(G_APPLICATION(app.application));
+    }
+    return G_SOURCE_REMOVE;
+}
+static void quit_probe_finished(GObject *source, GAsyncResult *result, gpointer data) {
+    QuitProbe *probe = data;
+    GError *error = NULL;
+    JSCValue *value = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(source), result, &error);
+    if (probe->deadline) { g_source_remove(probe->deadline); probe->deadline = 0; }
+    if (!probe->timed_out) {
+        app.quit_pending = FALSE;
+        if (WEBKIT_WEB_VIEW(source) == app.web) {
+            gboolean handled = value && !error && jsc_value_is_boolean(value) && jsc_value_to_boolean(value);
+            if (!handled) {
+                diagnostic_event("Workbench quit handoff failed; exiting desktop window");
+                g_application_quit(G_APPLICATION(app.application));
+            }
+        }
+    }
+    if (value) g_object_unref(value);
+    g_clear_error(&error);
+    g_object_unref(probe->cancel);
+    g_free(probe);
+}
+static void request_quit(void) {
+    if (!app.web || gtk_stack_get_visible_child(GTK_STACK(app.stack)) != GTK_WIDGET(app.web) ||
+        !app.port || !valid_workbench(webkit_web_view_get_uri(app.web), app.port, FALSE)) {
+        g_application_quit(G_APPLICATION(app.application));
+        return;
+    }
+    if (app.quit_pending) return;
+    app.quit_pending = TRUE;
+    QuitProbe *probe = g_new0(QuitProbe, 1);
+    probe->web = app.web;
+    probe->cancel = g_cancellable_new();
+    probe->deadline = g_timeout_add(1500, quit_probe_timeout, probe);
+    webkit_web_view_evaluate_javascript(app.web,
+        "typeof window.cageNativeAction==='function'?(window.cageNativeAction('quit'),true):false",
+        -1, NULL, NULL, probe->cancel, quit_probe_finished, probe);
 }
 static void menu_action(GSimpleAction *simple, GVariant *parameter, gpointer data) {
     (void)parameter; (void)data;
     const char *name = g_action_get_name(G_ACTION(simple));
     if (!strcmp(name, "closeWindow")) { gtk_widget_hide(app.window); publish_visibility(); }
-    else if (!strcmp(name, "quit")) {
-        if (gtk_stack_get_visible_child(GTK_STACK(app.stack)) == GTK_WIDGET(app.web)) action("quit");
-        else g_application_quit(G_APPLICATION(app.application));
+    else if (!strcmp(name, "reloadWorkbench")) {
+        gtk_widget_show(app.window);
+        gtk_window_deiconify(GTK_WINDOW(app.window));
+        gtk_window_present(GTK_WINDOW(app.window));
+        if (!app.bootstrapping) {
+            diagnostic_event("Reloading workbench WebView");
+            install_web_view();
+            bootstrap(app.needs_update ? "--existing" : NULL);
+        }
+    } else if (!strcmp(name, "quit")) {
+        request_quit();
     } else if (!strcmp(name, "updates")) {
         GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(app.window), GTK_DIALOG_MODAL, GTK_MESSAGE_INFO, GTK_BUTTONS_CLOSE,
-            "Linux 版本通过安装包更新。请保存文件、停止环境并退出 Cage，再安装已核对摘要的官方新版本。");
+            "%s", ui_text("Linux 版本通过安装包更新。请保存文件、停止环境并退出 Cage，再安装已核对摘要的官方新版本。"));
         gtk_dialog_run(GTK_DIALOG(dialog)); gtk_widget_destroy(dialog);
     } else if (!strcmp(name, "about")) {
         gtk_show_about_dialog(GTK_WINDOW(app.window), "program-name", "Cage", "version", CAGE_VERSION,
-            "comments", "本机隔离编码工作区", "license-type", GTK_LICENSE_MIT_X11, NULL);
+            "comments", ui_text("本机隔离编码工作区"), "license-type", GTK_LICENSE_MIT_X11, NULL);
     } else action(name);
 }
-static void add_menu_action(GMenu *menu, const char *name, const char *label, const char *accelerator) {
-    GSimpleAction *simple = g_simple_action_new(name, NULL);
-    g_signal_connect(simple, "activate", G_CALLBACK(menu_action), NULL);
-    g_action_map_add_action(G_ACTION_MAP(app.application), G_ACTION(simple));
-    g_object_unref(simple);
-    char *full = g_strconcat("app.", name, NULL);
-    g_menu_append(menu, label, full);
-    if (accelerator) {
-        const char *accelerators[] = {accelerator, NULL};
-        gtk_application_set_accels_for_action(app.application, full, accelerators);
-    }
-    g_free(full);
+static void update_menu(void) {
+    GMenu *file = g_menu_new(), *settings = g_menu_new(), *help = g_menu_new();
+    g_menu_append(file, ui_text("打开项目…"), "app.openProject");
+    g_menu_append(file, ui_text("新建网页"), "app.newTab");
+    g_menu_append(file, ui_text("新建终端"), "app.newTerminal");
+    g_menu_append(file, ui_text("关闭当前标签"), "app.closeTab");
+    g_menu_append(file, ui_text("重新加载界面"), "app.reloadWorkbench");
+    g_menu_append(file, ui_text("关闭窗口（保留环境）"), "app.closeWindow");
+    g_menu_append(file, ui_text("退出 Cage…"), "app.quit");
+    g_menu_append(settings, ui_text("打开设置"), "app.settings");
+    g_menu_append(settings, ui_text("应用更新…"), "app.updates");
+    g_menu_append(help, ui_text("关于 Cage"), "app.about");
+    g_menu_remove_all(app.menu);
+    g_menu_append_submenu(app.menu, ui_text("文件"), G_MENU_MODEL(file));
+    g_menu_append_submenu(app.menu, ui_text("设置"), G_MENU_MODEL(settings));
+    g_menu_append_submenu(app.menu, ui_text("帮助"), G_MENU_MODEL(help));
+    g_object_unref(file); g_object_unref(settings); g_object_unref(help);
 }
 static void create_window(void) {
     app.window = gtk_application_window_new(app.application);
@@ -1240,37 +1679,35 @@ static void create_window(void) {
     g_signal_connect(app.window, "window-state-event", G_CALLBACK(visibility_changed), NULL);
     g_signal_connect(app.window, "map-event", G_CALLBACK(visibility_changed), NULL);
     g_signal_connect(app.window, "unmap-event", G_CALLBACK(visibility_changed), NULL);
+    g_signal_connect(app.window, "notify::is-active", G_CALLBACK(focus_changed), NULL);
     g_object_get(gtk_settings_get_default(), "gtk-application-prefer-dark-theme", &app.initial_dark, NULL);
     GtkWidget *layout = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_add(GTK_CONTAINER(app.window), layout);
-    GMenu *menu = g_menu_new(), *file = g_menu_new(), *settings = g_menu_new(), *help = g_menu_new();
+    app.menu = g_menu_new();
     /* Workbench shortcuts stay in JavaScript so terminal/browser focus rules apply. */
-    add_menu_action(file, "openProject", "打开项目…", NULL);
-    add_menu_action(file, "newTab", "新建网页", NULL);
-    add_menu_action(file, "newTerminal", "新建终端", NULL);
-    add_menu_action(file, "closeTab", "关闭当前标签", NULL);
-    add_menu_action(file, "closeWindow", "关闭窗口（保留环境）", NULL);
-    add_menu_action(file, "quit", "退出 Cage…", "<Primary>q");
-    add_menu_action(settings, "settings", "打开设置", NULL);
-    add_menu_action(settings, "updates", "应用更新…", NULL);
-    add_menu_action(help, "about", "关于 Cage", NULL);
-    g_menu_append_submenu(menu, "文件", G_MENU_MODEL(file));
-    g_menu_append_submenu(menu, "设置", G_MENU_MODEL(settings));
-    g_menu_append_submenu(menu, "帮助", G_MENU_MODEL(help));
-    gtk_box_pack_start(GTK_BOX(layout), gtk_menu_bar_new_from_model(G_MENU_MODEL(menu)), FALSE, FALSE, 0);
-    g_object_unref(menu); g_object_unref(file); g_object_unref(settings); g_object_unref(help);
+    const char *actions[] = {"openProject", "newTab", "newTerminal", "closeTab", "reloadWorkbench", "closeWindow", "quit", "settings", "updates", "about"};
+    for (guint i = 0; i < G_N_ELEMENTS(actions); i++) {
+        GSimpleAction *simple = g_simple_action_new(actions[i], NULL);
+        g_signal_connect(simple, "activate", G_CALLBACK(menu_action), NULL);
+        g_action_map_add_action(G_ACTION_MAP(app.application), G_ACTION(simple));
+        g_object_unref(simple);
+    }
+    const char *quit_accels[] = {"<Primary>q", NULL};
+    gtk_application_set_accels_for_action(app.application, "app.quit", quit_accels);
+    update_menu();
+    gtk_box_pack_start(GTK_BOX(layout), gtk_menu_bar_new_from_model(G_MENU_MODEL(app.menu)), FALSE, FALSE, 0);
     app.stack = gtk_stack_new();
     gtk_box_pack_start(GTK_BOX(layout), app.stack, TRUE, TRUE, 0);
     GtkWidget *status_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 16);
     gtk_widget_set_margin_start(status_box, 48); gtk_widget_set_margin_end(status_box, 48);
     gtk_widget_set_margin_top(status_box, 48); gtk_widget_set_valign(status_box, GTK_ALIGN_START);
-    app.status = gtk_label_new("正在启动 Cage 工作台…");
+    app.status = gtk_label_new(ui_text("正在启动 Cage 工作台…"));
     gtk_label_set_line_wrap(GTK_LABEL(app.status), TRUE);
     gtk_label_set_xalign(GTK_LABEL(app.status), 0);
     gtk_box_pack_start(GTK_BOX(status_box), app.status, FALSE, FALSE, 0);
-    app.retry = gtk_button_new_with_label("重试连接");
-    app.existing = gtk_button_new_with_label("打开现有环境保存文件");
-    app.complete = gtk_button_new_with_label("保存后停止环境并完成更新");
+    app.retry = gtk_button_new_with_label(ui_text("重试连接"));
+    app.existing = gtk_button_new_with_label(ui_text("打开现有环境保存文件"));
+    app.complete = gtk_button_new_with_label(ui_text("保存后停止环境并完成更新"));
     GtkWidget *buttons[] = {app.retry, app.existing, app.complete};
     for (guint i = 0; i < G_N_ELEMENTS(buttons); i++) {
         gtk_widget_set_halign(buttons[i], GTK_ALIGN_START);
@@ -1284,29 +1721,23 @@ static void create_window(void) {
      * browser profile or guest browser data is shared with this WebView. */
     WebKitWebsiteDataManager *storage = webkit_website_data_manager_new(
         "base-data-directory", app.web_data, "base-cache-directory", app.web_cache, NULL);
-    WebKitWebContext *context = webkit_web_context_new_with_website_data_manager(storage);
+    app.web_context = webkit_web_context_new_with_website_data_manager(storage);
     g_object_unref(storage);
-    webkit_web_context_set_sandbox_enabled(context, TRUE);
-    webkit_website_data_manager_set_network_proxy_settings(webkit_web_context_get_website_data_manager(context), WEBKIT_NETWORK_PROXY_MODE_NO_PROXY, NULL);
-    g_signal_connect(context, "download-started", G_CALLBACK(deny_download), NULL);
+    webkit_web_context_set_sandbox_enabled(app.web_context, TRUE);
+    if (app.media_plugins_isolated) {
+        char *gst_root = g_build_filename(app.web_cache, "gstreamer", NULL);
+        char *gst_plugins = g_build_filename(gst_root, "plugins", NULL);
+        webkit_web_context_add_path_to_sandbox(app.web_context, gst_root, FALSE);
+        webkit_web_context_add_path_to_sandbox(app.web_context, gst_plugins, TRUE);
+        g_free(gst_plugins);
+        g_free(gst_root);
+    }
+    webkit_website_data_manager_set_network_proxy_settings(webkit_web_context_get_website_data_manager(app.web_context), WEBKIT_NETWORK_PROXY_MODE_NO_PROXY, NULL);
+    g_signal_connect(app.web_context, "download-started", G_CALLBACK(deny_download), NULL);
     app.content = webkit_user_content_manager_new();
     g_signal_connect(app.content, "script-message-with-reply-received::cageTransport", G_CALLBACK(bridge_received), NULL);
     webkit_user_content_manager_register_script_message_handler_with_reply(app.content, "cageTransport", NULL);
-    app.web = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW, "web-context", context, "user-content-manager", app.content, NULL));
-    input_initialize(app.web);
-    g_object_unref(context);
-    WebKitSettings *web_settings = webkit_web_view_get_settings(app.web);
-    webkit_settings_set_enable_developer_extras(web_settings, FALSE);
-    webkit_settings_set_javascript_can_open_windows_automatically(web_settings, FALSE);
-    webkit_settings_set_enable_write_console_messages_to_stdout(web_settings, FALSE);
-    g_signal_connect(app.web, "decide-policy", G_CALLBACK(decide_policy), NULL);
-    g_signal_connect(app.web, "permission-request", G_CALLBACK(deny_permission), NULL);
-    g_signal_connect(app.web, "run-file-chooser", G_CALLBACK(workbench_file_chooser), NULL);
-    g_signal_connect(app.web, "context-menu", G_CALLBACK(deny_context_menu), NULL);
-    g_signal_connect(app.web, "load-changed", G_CALLBACK(load_changed), NULL);
-    g_signal_connect(app.web, "load-failed", G_CALLBACK(load_failed), NULL);
-    g_signal_connect(app.web, "web-process-terminated", G_CALLBACK(process_terminated), NULL);
-    gtk_stack_add_named(GTK_STACK(app.stack), GTK_WIDGET(app.web), "web");
+    install_web_view();
     gtk_widget_show_all(app.window);
     bootstrap(NULL);
 }
@@ -1384,11 +1815,14 @@ int main(int argc, char **argv) {
         : CAGE_CLIENT_ONLY ? g_build_filename(g_get_home_dir(), ".claude-cage", "client", "config.json", NULL)
         : g_build_filename(g_get_home_dir(), ".claude-cage", "config.json", NULL);
     g_setenv("CLAUDE_CAGE_CONFIG", app.profile, TRUE);
+    load_language();
     g_log_set_default_handler(diagnostic_glib, NULL);
     if (!prepare_web_storage()) {
         g_printerr("无法创建 Cage 私有界面数据目录，请检查配置目录的所有者、权限或符号链接。\n");
         return 1;
     }
+    app.media_plugins_isolated = media_plugins_isolate(app.web_cache, media_plugins_system_dirs);
+    app.dmabuf_default_set = media_plugins_disable_dmabuf_default("");
     char *hash = g_compute_checksum_for_string(G_CHECKSUM_SHA256, app.profile, -1);
     char *id = g_strdup_printf("app.cage.desktop.p%.24s", hash);
     app.application = gtk_application_new(id, G_APPLICATION_FLAGS_NONE);
@@ -1403,6 +1837,9 @@ int main(int argc, char **argv) {
     g_object_unref(app.application);
     g_free(app.backend); g_free(app.profile); g_free(app.token); g_free(app.smoke_output);
     g_free(app.web_data); g_free(app.web_cache);
+    g_clear_object(&app.web_context);
     g_clear_object(&app.content);
+    g_clear_object(&app.menu);
+    g_clear_pointer(&app.messages, json_object_unref);
     return status ? status : app.result;
 }

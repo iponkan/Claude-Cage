@@ -45,7 +45,7 @@ for (const [platform, system] of [["darwin", "macos"], ["win32", "windows-11"], 
     await nav.getByRole("button", { name: "打开浏览器", exact: true }).click();
     await page.locator(".address-bar input").first().waitFor();
     await openAccounts();
-    await nav.getByRole("button", { name: "工作台", exact: true }).click();
+    await sidebar.getByRole("button", { name: "工作台", exact: true }).click();
     await accountPage.waitFor({ state: "hidden" });
     assert.equal(await entry.getAttribute("aria-current"), null);
     const terminal = page.getByRole("tab", { name: "原有终端", exact: true });
@@ -62,7 +62,7 @@ for (const [platform, system] of [["darwin", "macos"], ["win32", "windows-11"], 
     assert.equal(state.requests.filter(request => request.path === "/browser/new").length, 0);
     await openAccounts();
     await nav.getByRole("button", { name: "Claude Desktop", exact: true }).click();
-    await page.locator(".claude-desktop-toolbar").waitFor();
+    await page.locator(".claude-desktop-view").waitFor();
     await openAccounts();
     await page.getByRole("button", { name: "设置", exact: true }).click();
     await page.getByRole("navigation", { name: "设置分组" }).waitFor();

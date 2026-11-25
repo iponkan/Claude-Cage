@@ -1,9 +1,9 @@
 // Public downloads and metadata stay anonymous, including the manifest fallback.
 import { createHash } from 'node:crypto';
-import { createWriteStream } from 'node:fs';
+import { createWriteStream, realpathSync } from 'node:fs';
 import { mkdir, writeFile, rm } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { parseArgs } from 'node:util';
@@ -53,7 +53,7 @@ export async function publicManifestRelease(tag, fetchImpl = fetch) {
   }
   const version = tag.slice(1);
   const allowed = name => [
-    `Cage-${version}-macos-arm64.dmg`, `Cage-${version}-windows-amd64-setup.exe`,
+    `Cage-${version}-macos-arm64.dmg`, `Cage-${version}-macos-amd64.dmg`, `Cage-${version}-windows-amd64-setup.exe`,
     `Cage-${version}-windows-amd64-setup-unsigned.exe`, `Cage-${version}-linux-amd64.deb`,
     `Cage-${version}-android-arm64.apk`,
   ].includes(name) || sourceArchive(name);
@@ -145,7 +145,7 @@ export function releaseMetadata(release, text) {
 }
 
 const platformSuffixes = {
-  macos: 'macos-arm64.dmg', windows: 'windows-amd64-setup.exe',
+  macos: 'macos-arm64.dmg', macosIntel: 'macos-amd64.dmg', windows: 'windows-amd64-setup.exe',
   linux: 'linux-amd64.deb', android: 'android-arm64.apk',
 };
 
@@ -166,7 +166,7 @@ export function platformMetadata(release, text) {
     if (!asset) continue;
     try {
       checksumFor(text, asset);
-      if (platform === 'macos') {
+      if (platform === 'macos' || platform === 'macosIntel') {
         const source = release.assets.find(item => /^mihomo-v[\d.]+-source\.tar\.gz$/.test(item.name));
         if (!source || !optionalAsset(release, source.name)) continue;
         checksumFor(text, source);
@@ -278,6 +278,9 @@ async function main() {
   metadata.platforms = await resolvePlatforms(releases, item => item.tag_name === release.tag_name ? text : checksumText(item));
   if (values['archive-directory']) {
     await download(archive, digest, values['archive-directory']);
+    // The Intel Mac DMG shares the Mihomo source and is verified alongside.
+    const intel = optionalAsset(release, `Cage-${version}-macos-amd64.dmg`);
+    if (intel) await download(intel, checksumFor(text, intel), values['archive-directory']);
     await download(source, sourceDigest, values['archive-directory']);
     if (guestSource) await download(guestSource, checksumFor(text, guestSource), values['archive-directory']);
     await writeFile(join(values['archive-directory'], 'SHA256SUMS'), text);
@@ -292,6 +295,7 @@ async function main() {
   console.log(`Website download: Cage ${version}`);
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+// Node reports the entry module by its real path; compare real paths so symlinked checkouts still run.
+if (process.argv[1] && realpathSync(fileURLToPath(import.meta.url)) === realpathSync(resolve(process.argv[1]))) {
   main().catch(error => { console.error(error.message); process.exitCode = 1; });
 }

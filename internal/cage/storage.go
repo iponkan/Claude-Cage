@@ -1,6 +1,7 @@
 package cage
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -23,7 +24,14 @@ type StorageLocation struct {
 	Custom         bool   `json:"custom"`
 	HasEnvironment bool   `json:"has_environment"`
 	Backup         string `json:"backup,omitempty"`
+	// Missing marks a custom directory deleted while its parent remains; the
+	// location is then returned together with ErrStorageMissing.
+	Missing bool `json:"missing,omitempty"`
 }
+
+// ErrStorageMissing lets a new, empty location replace one whose directory
+// was deleted. A disconnected disk keeps the ordinary reconnect error.
+var ErrStorageMissing = errors.New("环境存储目录已不存在")
 
 type storageRecord struct {
 	Directory string   `json:"directory"`
@@ -193,6 +201,10 @@ func getStorageLocation(profile string) (StorageLocation, error) {
 		target, te := paths.Resolve(filepath.Join(r.Directory, "state"))
 		marker, me := os.ReadFile(filepath.Join(r.Directory, storageMarker))
 		if err != nil || te != nil || me != nil || string(marker) != r.ID || !sameStoragePath(real, target) {
+			if storageDeleted(anchor, r.Directory) {
+				loc.Missing = true
+				return loc, fmt.Errorf("%w：%s。如果它位于外接磁盘，请连接磁盘后重新打开设置；否则请选择新的存储位置，Cage 会在那里重新创建环境，原环境数据无法恢复。", ErrStorageMissing, r.Directory)
+			}
 			return loc, fmt.Errorf("环境存储不可用，请重新连接原磁盘：%s", r.Directory)
 		}
 		if err = localStorageVolume(target); err != nil {
@@ -237,6 +249,23 @@ func getStorageLocation(profile string) (StorageLocation, error) {
 		return loc, err
 	}
 	return loc, nil
+}
+
+// storageDeleted requires the anchor to be only a link (or absent) and the
+// directory's parent to still exist, so an unplugged volume is not mistaken
+// for deleted data and nothing real is left behind the anchor.
+func storageDeleted(anchor, directory string) bool {
+	if _, err := os.Lstat(directory); !errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	if parent, err := os.Stat(filepath.Dir(directory)); err != nil || !parent.IsDir() {
+		return false
+	}
+	if _, err := os.Readlink(anchor); err == nil {
+		return true
+	}
+	_, err := os.Lstat(anchor)
+	return errors.Is(err, os.ErrNotExist)
 }
 
 func GetStorageLocation(profile string) (StorageLocation, error) {
@@ -330,6 +359,12 @@ func validateStorageTarget(profile, directory, app, platform string) error {
 	if err != nil {
 		return err
 	}
+	if platform == "windows" {
+		excluded := windowsTargetStorageExcludedRoots()
+		if windowsStoragePathExcluded(directory, excluded) || windowsStoragePathExcluded(target, excluded) {
+			return errors.New("Windows 环境存储不能放在 AppData 或系统临时目录中，否则虚拟机会因本机套接字受限而无法启动；请选择 AppData 之外的本地文件夹")
+		}
+	}
 	// Check the actual mount, including junctions and symlinked parents.
 	existing := target
 	for {
@@ -421,6 +456,11 @@ func stoppedStorage(source string) error {
 			var pid int
 			started := ""
 			if name == "cage-running.json" {
+				if len(bytes.TrimSpace(data)) == 0 || !json.Valid(data) {
+					// Records are replaced atomically after fsync, so an empty or
+					// cut-off file only comes from an interrupted write and names no live VM.
+					continue
+				}
 				var record runningProfile
 				err = json.Unmarshal(data, &record)
 				pid, started = record.PID, record.Started
@@ -454,10 +494,14 @@ func MoveStorageWithRuntime(ctx context.Context, profile, directory string, expe
 		return loc, bindingErr
 	}
 	loc, err = getStorageLocation(profile)
-	if err != nil {
+	missing := expected.Missing && loc.Missing && errors.Is(err, ErrStorageMissing)
+	if err != nil && !missing {
 		return loc, err
 	}
-	if !sameStoragePath(expected.Directory, loc.Directory) || expected.HasEnvironment != loc.HasEnvironment {
+	if missing && runtime != nil {
+		return loc, err
+	}
+	if !sameStoragePath(expected.Directory, loc.Directory) || expected.HasEnvironment != loc.HasEnvironment || expected.Missing != loc.Missing {
 		return loc, errors.New("环境或存储位置已改变，请重新选择")
 	}
 	if err = ValidateStorageTarget(profile, directory); err != nil {
@@ -468,8 +512,10 @@ func MoveStorageWithRuntime(ctx context.Context, profile, directory string, expe
 		return loc, err
 	}
 	anchor := storageAnchor(profile)
-	if err = stoppedStorage(anchor); err != nil {
-		return loc, err
+	if !missing {
+		if err = stoppedStorage(anchor); err != nil {
+			return loc, err
+		}
 	}
 	previous, err := readStorageRecord(profile)
 	if err != nil {
@@ -487,7 +533,9 @@ func MoveStorageWithRuntime(ctx context.Context, profile, directory string, expe
 	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
 		return loc, statErr
 	}
-	if statErr == nil {
+	// A deleted directory has nothing to copy or keep; its dangling link is
+	// still renamed aside so an interrupted switch can be rolled back.
+	if statErr == nil && !missing {
 		backup := anchorBackup
 		if loc.Custom {
 			backup = loc.Directory
@@ -565,7 +613,7 @@ func MoveStorageWithRuntime(ctx context.Context, profile, directory string, expe
 			return loc, err
 		}
 	}
-	if info != nil {
+	if info != nil && !missing {
 		if err = copyStorageExcluding(ctx, src, destState, excluded, report); err != nil {
 			return loc, err
 		}
@@ -700,4 +748,84 @@ func recoverStorageWithRuntime(ctx context.Context, profile string, runtime Stor
 		return err
 	}
 	return os.Remove(journal)
+}
+
+// ResetBrokenStorageForRebuild detaches a broken custom storage configuration
+// (dangling state link/junction or stuck storage metadata/journal) after
+// explicit user confirmation to rebuild locally. Surviving external directories
+// are never deleted; detached storage metadata is preserved in a private
+// recovery archive inside profile before recreating a clean local state folder.
+func ResetBrokenStorageForRebuild(profile string) error {
+	f, err := os.OpenFile(filepath.Join(profile, "environment-storage.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	ok, err := lockStorageFile(f, true)
+	if err != nil || !ok {
+		if err == nil {
+			err = errors.New("环境正在运行或迁移中，请停止环境并等待当前操作完成")
+		}
+		return err
+	}
+
+	anchor := storageAnchor(profile)
+	anchorInfo, anchorErr := os.Lstat(anchor)
+	if anchorErr != nil && !errors.Is(anchorErr, os.ErrNotExist) {
+		return anchorErr
+	}
+	anchorIsLink := false
+	if anchorErr == nil {
+		if _, linkErr := os.Readlink(anchor); linkErr == nil || anchorInfo.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+			anchorIsLink = true
+		} else if anchorInfo.IsDir() {
+			if err := stoppedStorage(anchor); err != nil {
+				return err
+			}
+		}
+	}
+
+	var token [8]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return err
+	}
+	archiveDir := filepath.Join(profile, fmt.Sprintf("storage-recovery-archive-%x", token))
+	archiveCreated := false
+	archiveFile := func(src, name string) error {
+		if _, err := os.Lstat(src); errors.Is(err, os.ErrNotExist) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		if !archiveCreated {
+			if err := host.EnsurePrivateDir(archiveDir); err != nil {
+				return err
+			}
+			archiveCreated = true
+		}
+		return renameStorage(src, filepath.Join(archiveDir, name))
+	}
+
+	if err := archiveFile(filepath.Join(profile, pendingFile), pendingFile); err != nil {
+		return err
+	}
+	if err := archiveFile(filepath.Join(profile, locationFile), locationFile); err != nil {
+		return err
+	}
+	if anchorErr == nil {
+		if anchorIsLink {
+			if err := os.Remove(anchor); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		} else if !anchorInfo.IsDir() {
+			if err := archiveFile(anchor, "state-file"); err != nil {
+				return err
+			}
+		}
+	}
+	if err := host.EnsurePrivateDir(anchor); err != nil {
+		return err
+	}
+	_, err = getStorageLocation(profile)
+	return err
 }

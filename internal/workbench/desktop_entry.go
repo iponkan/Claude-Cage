@@ -11,6 +11,7 @@ import (
 
 	"github.com/sylvinus/agent-vm/internal/cage"
 	"github.com/sylvinus/agent-vm/internal/host"
+	"github.com/sylvinus/agent-vm/internal/vm"
 )
 
 // The entry and the local workload must never share a controller lock,
@@ -72,14 +73,12 @@ func DesktopEntry(fullConfig string, opts DesktopOptions) (DesktopResult, error)
 		if err != nil {
 			return err
 		}
-		cmd := exec.Command(exe, "serve-desktop")
-		cmd.Dir = profile
-		cmd.Env = append(os.Environ(), cage.ConfigEnv+"="+fullConfig)
-		detachController(cmd)
-		if err := cmd.Start(); err != nil {
-			return err
-		}
-		return cmd.Process.Release()
+		return startDetached(func() *exec.Cmd {
+			cmd := exec.Command(exe, "serve-desktop")
+			cmd.Dir = profile
+			cmd.Env = append(vm.ChildEnv(), cage.ConfigEnv+"="+fullConfig)
+			return cmd
+		})
 	})
 	if err != nil || owner == 0 || result.URL == "" {
 		return result, err

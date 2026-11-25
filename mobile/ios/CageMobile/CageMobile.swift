@@ -15,6 +15,7 @@ private var simulatorPreviewEnabled: Bool {
 struct ConnectedDevice: Identifiable {
     let id: String
     var name: String
+    let host: Host?
     let connection: CMConnection?
     let webView: WKWebView
 }
@@ -108,6 +109,8 @@ final class ConnectionModel: ObservableObject {
                     self.trusted = saved.host; self.pin = saved.host.pin; self.relay = saved.host.relay
                     self.imported = nil; self.invitation = nil; self.hasInvitation = false
                     self.hasSaved = true; self.needsTrust = false; self.verified = false
+                    let hostID = saved.host.relay + "|" + saved.host.pin
+                    if self.devices.contains(where: {$0.id == hostID}) {self.disconnectDevice(hostID)}
                     self.connect()
                 } catch { self.status = error.localizedDescription }
             }
@@ -195,7 +198,12 @@ final class ConnectionModel: ObservableObject {
                 }
                 self.connecting = false
                 switch result {
-                case .success(let session): self.status = ""; self.addDevice(session, host: host)
+                case .success(let session):
+                    self.status = ""
+                    if self.didBackground {
+                        self.linkQueue.async { session.suspend() }
+                    }
+                    self.addDevice(session, host: host)
                 case .failure(let error): self.status = error.localizedDescription
                 }
             }
@@ -237,7 +245,7 @@ final class ConnectionModel: ObservableObject {
         web.navigationDelegate = delegate
         // WKWebView holds its navigation delegate weakly.
         navigationDelegates[id] = delegate
-        devices.append(ConnectedDevice(id: id, name: "已连接电脑", connection: connection, webView: web))
+        devices.append(ConnectedDevice(id: id, name: "已连接电脑", host: host, connection: connection, webView: web))
         selectDevice(id)
         var launch = connection.launchURL
         if openArchivedAfterConnect {
@@ -282,12 +290,104 @@ final class ConnectionModel: ObservableObject {
     }
     func disconnect() {if let id = selectedDeviceID {disconnectDevice(id)}}
     func reconnect() {disconnect(); connect()}
+    func reconnectSaved() {
+        if let host = trusted {
+            let id = host.relay + "|" + host.pin
+            if devices.contains(where: {$0.id == id}) {disconnectDevice(id)}
+        }
+        connect()
+    }
+    private var didBackground = false
+    private var lifecycleGeneration = 0
+    private func connectSavedHost(_ host: Host) {
+        guard !connecting,
+              let directory = Bundle.main.url(forResource: "mobile-ui", withExtension: nil) else {
+            status = "设备连接已失效，请重新连接。"; return
+        }
+        connecting = true; generation += 1
+        let attempt = generation
+        status = "正在恢复与电脑的连接…"
+        linkQueue.async {
+            let result = Result {
+                guard let saved = try HostKeychain.read(host: host), saved.host == host else { throw InputError.unavailable }
+                return try CMConnection.connectSaved(relay: host.relay, lookup: saved.lookup, pin: host.pin, assets: directory.path)
+            }
+            DispatchQueue.main.async {
+                guard attempt == self.generation else {
+                    if case .success(let old) = result { DispatchQueue.global().async { old.close() } }
+                    return
+                }
+                self.connecting = false
+                switch result {
+                case .success(let session):
+                    self.status = ""
+                    if self.didBackground {
+                        self.linkQueue.async { session.suspend() }
+                    }
+                    self.addDevice(session, host: host)
+                case .failure(let error): self.status = error.localizedDescription
+                }
+            }
+        }
+    }
+    func handleBackground() {
+        didBackground = true
+        lifecycleGeneration += 1
+        let connections = devices.compactMap(\.connection)
+        guard !connections.isEmpty else {return}
+        var taskID = UIBackgroundTaskIdentifier.invalid
+        taskID = UIApplication.shared.beginBackgroundTask(withName: "CageMobile.suspend") {
+            if taskID != .invalid {
+                UIApplication.shared.endBackgroundTask(taskID)
+                taskID = .invalid
+            }
+        }
+        linkQueue.async {
+            for connection in connections {connection.suspend()}
+            DispatchQueue.main.async {
+                if taskID != .invalid {
+                    UIApplication.shared.endBackgroundTask(taskID)
+                    taskID = .invalid
+                }
+            }
+        }
+    }
+    func handleForeground() {
+        guard didBackground else {return}
+        didBackground = false
+        lifecycleGeneration += 1
+        let lifecycle = lifecycleGeneration
+        let snapshot = devices
+        guard !snapshot.isEmpty else {return}
+        linkQueue.async {
+            for device in snapshot {
+                guard let connection = device.connection else {continue}
+                let ok = connection.resume()
+                DispatchQueue.main.async {
+                    guard self.lifecycleGeneration == lifecycle, !self.didBackground else {return}
+                    guard let current = self.devices.first(where: {$0.id == device.id}),
+                          current.connection === connection else {return}
+                    if ok {
+                        current.webView.evaluateJavaScript("window.dispatchEvent(new Event('online'))")
+                    } else {
+                        let wasSelected = (self.selectedDeviceID == device.id && self.showingWorkspace)
+                        self.disconnectDevice(device.id)
+                        if wasSelected, let host = device.host, (try? HostKeychain.read(host: host)) != nil {
+                            self.connectSavedHost(host)
+                        } else {
+                            self.status = "部分设备的连接已失效，请重新连接。"
+                        }
+                    }
+                }
+            }
+        }
+    }
     func startPreview() {
         #if targetEnvironment(simulator)
         for (id, name) in [("preview-mac", "我的电脑 · 模拟器预览"), ("preview-linux", "Linux 工作站 · 模拟器预览")] {
             if !devices.contains(where: {$0.id == id}) {
                 let preview = SimulatorWorkspacePreview.makeWebView(model: self, id: id)
-                devices.append(ConnectedDevice(id: id, name: name, connection: nil, webView: preview.web))
+                devices.append(ConnectedDevice(id: id, name: name, host: nil, connection: nil, webView: preview.web))
                 navigationDelegates[id] = preview.delegate
             }
         }
@@ -346,7 +446,6 @@ private struct ActionLabel: View {
 }
 
 private struct QRScanner: UIViewControllerRepresentable {
-    let region: CGRect
     @Binding var hint: String
     let result: (String?) -> Void
     final class Delegate: NSObject, DataScannerViewControllerDelegate {
@@ -354,15 +453,27 @@ private struct QRScanner: UIViewControllerRepresentable {
         var hint: Binding<String>
         var finished = false
         init(_ result: @escaping (String?) -> Void, hint: Binding<String>) {self.result = result; self.hint = hint}
-        func dataScanner(_ scanner: DataScannerViewController, didAdd items: [RecognizedItem], allItems: [RecognizedItem]) {
+        private func handle(_ items: [RecognizedItem], in scanner: DataScannerViewController) {
+            guard !finished else {return}
+            var sawInvalidQR = false
             for case .barcode(let barcode) in items {
-                guard !finished, let code = barcode.payloadStringValue else {continue}
-                guard code.hasPrefix("CAGE1:"), code.utf8.count <= 4096 else {
-                    hint.wrappedValue = "请扫描电脑「设置 → 远程连接」中的 Cage 配对二维码"; continue
+                guard let code = barcode.payloadStringValue else {continue}
+                if code.hasPrefix("CAGE1:"), code.utf8.count <= 4096 {
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    finished = true; scanner.stopScanning(); result(code); return
                 }
-                UINotificationFeedbackGenerator().notificationOccurred(.success)
-                finished = true; scanner.stopScanning(); result(code); return
+                sawInvalidQR = true
             }
+            let invalidHint = "请扫描电脑「设置 → 远程连接」中的 Cage 配对二维码"
+            if sawInvalidQR, hint.wrappedValue != invalidHint {
+                hint.wrappedValue = invalidHint
+            }
+        }
+        func dataScanner(_ scanner: DataScannerViewController, didAdd items: [RecognizedItem], allItems: [RecognizedItem]) {
+            handle(allItems, in: scanner)
+        }
+        func dataScanner(_ scanner: DataScannerViewController, didUpdate items: [RecognizedItem], allItems: [RecognizedItem]) {
+            handle(allItems, in: scanner)
         }
         func dataScanner(_ scanner: DataScannerViewController, becameUnavailableWithError error: DataScannerViewController.ScanningUnavailable) {
             if !finished {finished = true; result(nil)}
@@ -370,16 +481,23 @@ private struct QRScanner: UIViewControllerRepresentable {
     }
     func makeCoordinator() -> Delegate { Delegate(result, hint: $hint) }
     func makeUIViewController(context: Context) -> DataScannerViewController {
-        let scanner = DataScannerViewController(recognizedDataTypes: [.barcode(symbologies: [.qr])], qualityLevel: .balanced, isGuidanceEnabled: false, isHighlightingEnabled: false)
+        let scanner = DataScannerViewController(recognizedDataTypes: [.barcode(symbologies: [.qr])],
+                                                qualityLevel: .accurate,
+                                                recognizesMultipleItems: true,
+                                                isPinchToZoomEnabled: true,
+                                                isGuidanceEnabled: false,
+                                                isHighlightingEnabled: false)
         scanner.delegate = context.coordinator
         DispatchQueue.main.async {
-            guard !context.coordinator.finished else {return}
-            scanner.regionOfInterest = region
+            guard !context.coordinator.finished, !scanner.isScanning else {return}
             do { try scanner.startScanning() } catch {context.coordinator.finished = true; result(nil)}
         }
         return scanner
     }
-    func updateUIViewController(_ scanner: DataScannerViewController, context: Context) {scanner.regionOfInterest = region}
+    func updateUIViewController(_ scanner: DataScannerViewController, context: Context) {
+        guard !context.coordinator.finished, !scanner.isScanning, scanner.view.window != nil else {return}
+        try? scanner.startScanning()
+    }
     static func dismantleUIViewController(_ scanner: DataScannerViewController, coordinator: Delegate) {coordinator.finished = true; scanner.stopScanning()}
 }
 
@@ -421,26 +539,30 @@ private struct QRScannerScreen: View {
                     .foregroundStyle(.white.opacity(0.8)).frame(width: side * 0.65, height: side * 0.65)
                     .position(x: box.midX, y: box.midY).accessibilityHidden(true)
                 #else
-                QRScanner(region: box, hint: $hint, result: result)
+                QRScanner(hint: $hint, result: result)
                 #endif
                 FinderMask(box: box).fill(Color(red: 0.08, green: 0.09, blue: 0.09).opacity(0.72), style: FillStyle(eoFill: true))
+                    .allowsHitTesting(false)
                 RoundedRectangle(cornerRadius: 18).stroke(.white.opacity(0.45), lineWidth: 1)
                     .frame(width: side, height: side).position(x: box.midX, y: box.midY)
+                    .allowsHitTesting(false)
                 FinderCorners().stroke(accent, style: StrokeStyle(lineWidth: 4, lineCap: .round))
                     .frame(width: side, height: side).position(x: box.midX, y: box.midY)
+                    .allowsHitTesting(false)
                 VStack(spacing: 0) {
                     LinearGradient(colors: [accent.opacity(0), accent.opacity(0.22)], startPoint: .top, endPoint: .bottom).frame(height: 26)
                     Capsule().fill(accent).frame(height: 2)
                 }.frame(width: side - 24)
                     .position(x: box.midX, y: reduceMotion ? box.midY : box.minY + 24 + (sweeping ? side - 48 : 0))
                     .animation(reduceMotion ? nil : .linear(duration: 2.4).repeatForever(autoreverses: true), value: sweeping)
+                    .allowsHitTesting(false)
                     .accessibilityHidden(true)
                 VStack(spacing: 12) {
                     Text("连接你的电脑").font(.title2.bold())
                     Text(hint).font(.subheadline).foregroundStyle(.white.opacity(0.88)).multilineTextAlignment(.center)
                     Text(simulatorPreviewEnabled ? "模拟器预览 · 即将进入示例工作台" : "仅识别 Cage 配对码")
                         .font(.caption).foregroundStyle(.white.opacity(0.6))
-                }.foregroundStyle(.white).padding(.horizontal, 24).padding(.bottom, 24).accessibilityElement(children: .combine)
+                }.foregroundStyle(.white).padding(.horizontal, 24).padding(.bottom, 24).allowsHitTesting(false).accessibilityElement(children: .combine)
             }.background(Color.black).onAppear {sweeping = true}
                 .task {
                     #if targetEnvironment(simulator)
@@ -484,7 +606,7 @@ private struct ConnectionSheet: View {
                     } label: {ActionLabel(title: "扫码连接", symbol: "qrcode.viewfinder")}
                     Button {manual = true} label: {ActionLabel(title: "使用配对码", symbol: "key", primary: false)}
                     if model.hasSaved || model.hasInvitation {
-                        Button("重新连接", action: model.connect).frame(minHeight: 44).disabled(!model.canConnect)
+                        Button("重新连接", action: model.reconnectSaved).frame(minHeight: 44).disabled(!model.canConnect)
                     }
                     if !model.devices.isEmpty {
                         Divider().padding(.vertical, 8)
@@ -514,7 +636,7 @@ private struct ConnectionSheet: View {
                                 .disabled(code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.connecting)
                         }
                         if !model.status.isEmpty {Section {status}}
-                    }.navigationTitle("配对码")
+                    }.buttonStyle(.automatic).navigationTitle("配对码")
                 }
                 .sheet(item: $disconnecting) {device in
                     VStack(spacing: 20) {
@@ -527,7 +649,7 @@ private struct ConnectionSheet: View {
                             disconnecting = nil
                         }.frame(maxWidth: .infinity, minHeight: 48)
                         Button("保留连接") {disconnecting = nil}.frame(minHeight: 44)
-                    }.padding(24).presentationDetents([.height(300)]).presentationDragIndicator(.visible)
+                    }.buttonStyle(.automatic).padding(24).presentationDetents([.height(300)]).presentationDragIndicator(.visible)
                 }
                 .sheet(isPresented: $scanning, onDismiss: {
                     if previewScanned {previewScanned = false; previewConnected()}
@@ -595,6 +717,7 @@ private struct SettingsScreen: View {
                 DisclosureGroup("中继设置", isExpanded: $relaySettings) {
                     Toggle("使用自建中继", isOn: Binding(get: {model.relay != CMConnection.defaultRelay()},
                                                      set: {model.relay = $0 ? "" : CMConnection.defaultRelay()}))
+                        .tint(.green)
                     if model.relay != CMConnection.defaultRelay() {
                         TextField("自建 VPS 的 HTTPS 地址", text: $model.relay)
                             .keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
@@ -608,14 +731,14 @@ private struct SettingsScreen: View {
                         .disabled(model.fingerprint.isEmpty)
                     Button("导入连接文件") {picking = true}
                     TextField("电脑指纹 sha256:…", text: $model.pin).textInputAutocapitalization(.never).autocorrectionDisabled()
-                    Toggle("已核对电脑指纹", isOn: $model.verified)
+                    Toggle("已核对电脑指纹", isOn: $model.verified).tint(.green)
                     Button("保存已核对的主机", action: model.saveTrust).disabled(!model.verified)
                     if model.hasInvitation || model.hasSaved {Button("连接工作台", action: connect).disabled(!model.canConnect)}
                 }
                 if model.canForget {Button("忘记主机", role: .destructive) {confirmingForget = true}}
             }
             if !model.status.isEmpty {Section {Text(model.status).font(.footnote).foregroundStyle(.secondary)}}
-        }.navigationTitle("设置").disabled(model.connecting)
+        }.buttonStyle(.automatic).navigationTitle("设置").disabled(model.connecting)
             .alert("忘记主机？", isPresented: $confirmingForget) {
                 Button("取消", role: .cancel) {}
                 Button("忘记主机", role: .destructive, action: model.forget)
@@ -628,6 +751,7 @@ private struct SettingsScreen: View {
 
 @main
 struct CageMobileApp: App {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model = ConnectionModel()
     @AppStorage("appearance-theme") private var theme = CageTheme.system
     @State private var showingSettings = false
@@ -646,17 +770,21 @@ struct CageMobileApp: App {
                 .navigationDestination(isPresented: $showingSettings) {
                     SettingsScreen(model: model, theme: $theme, connect: model.connect)
                 }
-            }.buttonStyle(CageButtonStyle()).tint(CageStyle.ink).preferredColorScheme(theme.scheme)
+            }.tint(CageStyle.ink).preferredColorScheme(theme.scheme)
                 .sheet(isPresented: $pairing) {
                     ConnectionSheet(model: model, previewConnected: {
                         pairing = false; showingSettings = false; model.startPreview()
-                    }).buttonStyle(CageButtonStyle()).tint(CageStyle.ink).preferredColorScheme(theme.scheme)
+                    }).tint(CageStyle.ink).preferredColorScheme(theme.scheme)
                 }
                 .onChange(of: model.showingWorkspace) { _, connected in
                     if connected {pairing = false; showingSettings = false}
                 }
                 .onChange(of: model.relay) {model.verified = false}
                 .onChange(of: model.pin) {model.verified = false}
+                .onChange(of: scenePhase) { _, phase in
+                    if phase == .background {model.handleBackground()}
+                    else if phase == .active {model.handleForeground()}
+                }
         }
     }
     private var home: some View {
